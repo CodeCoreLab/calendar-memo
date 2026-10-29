@@ -1,0 +1,24 @@
+[package]
+name = "memo-desktop"
+version = "1.0.0"
+edition = "2021"
+description = "日历备忘录（本地版）"
+
+[[bin]]
+name = "memo-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon：系统托盘（Tauri 2.x 内置 feature，非独立 plugin）
+# image-png：托盘图标从 PNG 字节载入（窗口图标复用同一份）
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+
+[profile.release]
+opt-level = "z"      # 体积优先
+lto = true
+codegen-units = 1
+strip = true         # 剥离符号，exe 体积约减半
+panic = "abort"

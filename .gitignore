@@ -1,0 +1,57 @@
+# ── 数据与运行产物：绝不可提交 ──
+# data/ 内含 memo.db（真实账号、日程、Token 哈希）与用户上传图片。
+# 一旦提交，历史记录里永久可查，删掉文件也清不干净。
+data/
+*.db
+*.db-wal
+*.db-shm
+uploads/
+restore-*.db
+memo-backup-*.db
+sidecar-port.txt
+run.log
+
+# ── 凭据：任何形态都不入仓 ──
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets/
+*_token.txt
+*_secret.txt
+
+# ── 构建产物：可由源码重建 ──
+/build/
+/build-sidecar/
+/dist/
+/dist-sidecar/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── Rust / Tauri ──
+tauri/target/
+tauri/memo-server.exe
+tauri/gen/
+Cargo.lock.bak
+
+# ── 编辑器与系统 ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 项目私有数据（记忆/工作区状态，不入公共仓库）──
+.workbuddy/
+
+# ── 审计/测试临时产物 ──
+audit_findings.json
+audit_scan.py
+probe_*.py
+smoke_check.py
+.audit/

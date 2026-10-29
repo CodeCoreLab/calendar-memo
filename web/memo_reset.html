@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>找回密码 · 我的备忘录</title>
+<style>
+:root{
+  --primary:#4f46e5; --primary2:#7c3aed; --accent:#06b6d4;
+  --ok:#10b981; --danger:#ef4444;
+  --ink:#0f172a; --ink2:#475569; --ink3:#94a3b8; --line:#e2e8f0;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+  background:#eef2ff;color:var(--ink);
+  display:flex;align-items:center;justify-content:center;
+  position:relative;overflow:hidden;padding:24px;
+}
+
+/* ── 背景 ── */
+.bg{position:fixed;inset:0;z-index:0;overflow:hidden;
+  background:linear-gradient(140deg,#eef2ff 0%,#faf5ff 40%,#ecfeff 100%);}
+.blob{position:absolute;border-radius:50%;filter:blur(60px);opacity:.5;}
+.b1{width:480px;height:480px;background:radial-gradient(circle,#6366f1,transparent 70%);top:-150px;left:-110px;animation:drift 14s ease-in-out infinite;}
+.b2{width:400px;height:400px;background:radial-gradient(circle,#a855f7,transparent 70%);bottom:-130px;right:-90px;animation:drift 11s ease-in-out infinite reverse;}
+.b3{width:280px;height:280px;background:radial-gradient(circle,#22d3ee,transparent 70%);top:45%;left:58%;animation:drift 18s ease-in-out infinite .8s;}
+@keyframes drift{
+  0%,100%{transform:translate(0,0) scale(1);}
+  33%{transform:translate(40px,-30px) scale(1.08);}
+  66%{transform:translate(-30px,25px) scale(.94);}
+}
+.bg::after{content:'';position:absolute;inset:0;
+  background-image:linear-gradient(rgba(99,102,241,.05) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(99,102,241,.05) 1px,transparent 1px);
+  background-size:44px 44px;}
+
+/* ── 卡片 ── */
+.card{
+  position:relative;z-index:1;
+  width:min(440px,94vw);
+  background:rgba(255,255,255,.85);
+  backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
+  border:1px solid rgba(255,255,255,.7);
+  border-radius:24px;
+  box-shadow:0 18px 60px rgba(79,70,229,.18),0 2px 8px rgba(15,23,42,.06);
+  padding:38px 36px 32px;
+  animation:rise .7s cubic-bezier(.16,1,.3,1) both;
+}
+@keyframes rise{from{opacity:0;transform:translateY(34px) scale(.97);}to{opacity:1;transform:none;}}
+
+.back{display:inline-block;font-size:.8em;color:var(--ink3);text-decoration:none;transition:.2s;margin-bottom:18px;}
+.back:hover{color:var(--primary);}
+
+.icon-badge{
+  width:52px;height:52px;border-radius:16px;
+  background:linear-gradient(135deg,var(--primary),var(--primary2));
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.5em;color:#fff;margin-bottom:16px;
+  box-shadow:0 8px 22px rgba(79,70,229,.32);
+  animation:pop .6s cubic-bezier(.16,1,.3,1) both .1s;
+}
+@keyframes pop{from{opacity:0;transform:scale(.5) rotate(-15deg);}to{opacity:1;transform:none;}}
+
+h1{font-size:1.35em;font-weight:800;letter-spacing:-.01em;margin-bottom:6px;}
+.sub{font-size:.83em;color:var(--ink2);line-height:1.7;margin-bottom:22px;}
+
+/* ── 步骤指示 ── */
+.steps{display:flex;align-items:center;margin-bottom:24px;}
+.step{display:flex;align-items:center;gap:8px;font-size:.76em;color:var(--ink3);flex-shrink:0;}
+.step .dot{
+  width:24px;height:24px;border-radius:50%;background:#e8ecf3;color:var(--ink3);
+  display:flex;align-items:center;justify-content:center;font-size:.85em;font-weight:700;
+  transition:.35s cubic-bezier(.16,1,.3,1);
+}
+.step.on{color:var(--primary);font-weight:700;}
+.step.on .dot{background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;
+  box-shadow:0 3px 10px rgba(79,70,229,.35);}
+.step.done .dot{background:var(--ok);color:#fff;box-shadow:none;}
+.line{flex:1;height:2px;background:#e8ecf3;margin:0 10px;position:relative;overflow:hidden;}
+.line i{position:absolute;inset:0;width:0;background:linear-gradient(90deg,var(--primary),var(--primary2));
+  transition:width .5s cubic-bezier(.16,1,.3,1);}
+.line.fill i{width:100%;}
+
+/* ── 表单 ── */
+.field{margin-bottom:16px;}
+.field label{display:block;font-size:.78em;font-weight:600;color:var(--ink2);margin-bottom:7px;}
+.inp-wrap{position:relative;}
+.inp-wrap .icon{position:absolute;left:13px;top:50%;transform:translateY(-50%);font-size:.95em;opacity:.55;pointer-events:none;}
+.field input{
+  width:100%;padding:12px 14px 12px 38px;
+  border:1.5px solid var(--line);border-radius:12px;
+  font-size:.9em;color:var(--ink);background:#fff;
+  transition:.25s cubic-bezier(.4,0,.2,1);outline:none;
+}
+.field input:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(79,70,229,.12);}
+.field input::placeholder{color:#b9c2d0;}
+
+/* 验证码：输入框 + 按钮一行 */
+.code-row{display:flex;gap:10px;}
+.code-row .inp-wrap{flex:1;}
+.code-row input{letter-spacing:.35em;font-weight:700;font-size:1.05em;}
+.code-btn{
+  flex-shrink:0;padding:0 16px;border:1.5px solid var(--primary);border-radius:12px;
+  background:#fff;color:var(--primary);font-size:.8em;font-weight:700;cursor:pointer;
+  transition:.25s;white-space:nowrap;min-width:104px;
+}
+.code-btn:hover:not([disabled]){background:var(--primary);color:#fff;}
+.code-btn[disabled]{border-color:var(--line);color:var(--ink3);cursor:not-allowed;}
+
+.btn{
+  width:100%;padding:13px;border:none;border-radius:12px;cursor:pointer;
+  font-size:.95em;font-weight:700;color:#fff;
+  background:linear-gradient(135deg,var(--primary),var(--primary2));
+  box-shadow:0 6px 20px rgba(79,70,229,.32);
+  transition:.25s cubic-bezier(.4,0,.2,1);
+  display:flex;align-items:center;justify-content:center;gap:8px;
+}
+.btn:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(79,70,229,.42);}
+.btn:active{transform:translateY(0) scale(.985);}
+.btn[disabled]{opacity:.7;cursor:not-allowed;transform:none;}
+.spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;
+  border-radius:50%;animation:spin .7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.strength{display:flex;gap:5px;margin-top:8px;}
+.strength i{flex:1;height:4px;border-radius:3px;background:#e2e8f0;transition:.3s;}
+.strength.s1 i:nth-child(1){background:#ef4444;}
+.strength.s2 i:nth-child(-n+2){background:#f59e0b;}
+.strength.s3 i:nth-child(-n+3){background:#10b981;}
+.strength.s4 i{background:#059669;}
+.strength-txt{font-size:.72em;color:var(--ink3);margin-top:6px;min-height:1em;}
+
+.alert{
+  margin-bottom:14px;padding:10px 14px;border-radius:10px;font-size:.8em;
+  display:none;align-items:center;gap:8px;line-height:1.6;
+  animation:shake .4s cubic-bezier(.36,.07,.19,.97);
+}
+.alert.show{display:flex;}
+.alert.err{background:#fef2f2;color:#dc2626;border:1px solid #fecaca;}
+.alert.ok{background:#ecfdf5;color:#059669;border:1px solid #a7f3d0;}
+.alert.info{background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe;}
+@keyframes shake{10%,90%{transform:translateX(-2px);}30%,70%{transform:translateX(3px);}50%{transform:translateX(-3px);}}
+
+/* ── 阶段切换 ── */
+.stage{display:none;animation:fadeUp .45s cubic-bezier(.16,1,.3,1) both;}
+.stage.active{display:block;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+
+/* ── 完成态 ── */
+.done-wrap{text-align:center;padding:8px 0 4px;}
+.done-ic{
+  width:72px;height:72px;margin:0 auto 18px;border-radius:50%;
+  background:linear-gradient(135deg,#10b981,#059669);
+  display:flex;align-items:center;justify-content:center;
+  font-size:2em;color:#fff;
+  box-shadow:0 10px 30px rgba(16,185,129,.35);
+  animation:pop .6s cubic-bezier(.16,1,.3,1) both;
+}
+.done-wrap h2{font-size:1.15em;font-weight:800;margin-bottom:8px;}
+.done-wrap p{font-size:.84em;color:var(--ink2);line-height:1.8;margin-bottom:22px;}
+.countdown{font-size:.78em;color:var(--ink3);margin-top:14px;}
+.countdown b{color:var(--primary);}
+
+.tip{font-size:.76em;color:var(--ink3);text-align:center;margin-top:16px;line-height:1.7;}
+.tip a{color:var(--primary);text-decoration:none;font-weight:600;}
+.tip a:hover{text-decoration:underline;}
+
+@media(max-width:480px){
+  .card{padding:30px 24px 26px;}
+  body{align-items:flex-start;overflow:auto;}
+  html,body{height:auto;min-height:100%;}
+}
+</style>
+</head>
+<body>
+<div class="bg">
+  <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+</div>
+
+<div class="card">
+  <a class="back" href="/memo_login.html">← 返回登录</a>
+
+  <!-- 完成态 -->
+  <div class="stage" id="stage-done">
+    <div class="done-wrap">
+      <div class="done-ic">✓</div>
+      <h2>密码重置成功</h2>
+      <p>你的密码已更新，请使用新密码重新登录。<br>如非本人操作，请立即再次重置。</p>
+      <button class="btn" id="goLoginBtn">立即去登录</button>
+      <div class="countdown"><b id="cdNum">3</b> 秒后自动跳转...</div>
+    </div>
+  </div>
+
+  <!-- 步骤 1+2 -->
+  <div class="stage active" id="stage-main">
+    <div class="icon-badge">🔑</div>
+    <h1>找回密码</h1>
+    <div class="sub">输入注册时填写的邮箱，我们会发送验证码确认你的身份。</div>
+
+    <div class="steps">
+      <div class="step on" id="step1"><span class="dot">1</span>验证邮箱</div>
+      <div class="line" id="line1"><i></i></div>
+      <div class="step" id="step2"><span class="dot">2</span>设置新密码</div>
+    </div>
+
+    <div class="alert" id="alert"></div>
+
+    <div class="field">
+      <label>注册邮箱</label>
+      <div class="inp-wrap"><span class="icon">📧</span>
+        <input type="email" id="email" placeholder="请输入注册时填写的邮箱" autocomplete="email"></div>
+    </div>
+
+    <div class="field">
+      <label>邮箱验证码</label>
+      <div class="code-row">
+        <div class="inp-wrap"><span class="icon">🔢</span>
+          <input type="text" id="code" placeholder="6 位数字" maxlength="6" inputmode="numeric" autocomplete="one-time-code"></div>
+        <button class="code-btn" id="sendBtn">获取验证码</button>
+      </div>
+    </div>
+
+    <div class="field" id="pwdField" style="display:none">
+      <label>新密码（至少 8 位，需含字母和数字）</label>
+      <div class="inp-wrap"><span class="icon">🔒</span>
+        <input type="password" id="newPwd" placeholder="请设置新密码" autocomplete="new-password"></div>
+      <div class="strength" id="pwdBar"><i></i><i></i><i></i><i></i></div>
+      <div class="strength-txt" id="pwdTxt"></div>
+    </div>
+
+    <div class="field" id="pwd2Field" style="display:none">
+      <label>确认新密码</label>
+      <div class="inp-wrap"><span class="icon">🔒</span>
+        <input type="password" id="newPwd2" placeholder="请再次输入新密码" autocomplete="new-password"></div>
+    </div>
+
+    <button class="btn" id="nextBtn">下一步</button>
+    <div class="tip">想起来了？<a href="/memo_login.html">返回登录 →</a></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let stage = 1;            // 1=填邮箱+验证码  2=填新密码
+let cooldown = 0, timer = null;
+
+function showAlert(msg, type){
+  const el = $('#alert');
+  el.className = 'alert show ' + (type || 'err');
+  el.textContent = msg;
+}
+function hideAlert(){ $('#alert').className = 'alert'; }
+
+function loading(btn, on){
+  if(on){
+    btn.dataset.txt = btn.innerHTML;
+    btn.innerHTML = '<span class="spin"></span>处理中...';
+    btn.disabled = true;
+  }else{
+    btn.innerHTML = btn.dataset.txt || '提交';
+    btn.disabled = false;
+  }
+}
+
+async function post(url, body){
+  const res = await fetch(url, {
+    method:'POST', credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+/* ── 密码强度条 ── */
+$('#newPwd').addEventListener('input', e=>{
+  const v = e.target.value, bar = $('#pwdBar'), txt = $('#pwdTxt');
+  let s = 0;
+  if(v.length >= 8) s++;
+  if(/[A-Za-z]/.test(v) && /[0-9]/.test(v)) s++;
+  if(/[^A-Za-z0-9]/.test(v)) s++;
+  if(v.length >= 12) s++;
+  bar.className = 'strength' + (v ? ' s'+s : '');
+  txt.textContent = !v ? '' : ['太弱，请加长并混合字母数字','较弱','一般，可用','较强','很强'][s];
+});
+
+/* ── 验证码只能输数字 ── */
+$('#code').addEventListener('input', e=>{
+  e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
+});
+
+/* ── 获取验证码 ── */
+async function sendCode(){
+  const email = $('#email').value.trim();
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){
+    showAlert('请填写正确的邮箱地址'); $('#email').focus(); return;
+  }
+  const btn = $('#sendBtn'); loading(btn, true);
+  try{
+    const ret = await post('/api/memo/send_code', {email, purpose:'reset'});
+    if(ret.code === 0){
+      const dev = ret.data && ret.data.devCode;
+      showAlert(dev
+        ? '验证码已生成（开发模式）：' + dev
+        : ret.msg, dev ? 'info' : 'ok');
+      startCooldown(ret.data && ret.data.ttl ? 60 : 60);
+      $('#code').focus();
+    }else{
+      showAlert(ret.msg || '发送失败'); loading(btn, false);
+    }
+  }catch(e){
+    showAlert('网络异常，请稍后重试'); loading(btn, false);
+  }
+}
+
+function startCooldown(sec){
+  cooldown = sec;
+  const btn = $('#sendBtn');
+  btn.disabled = true;
+  clearInterval(timer);
+  timer = setInterval(()=>{
+    cooldown--;
+    if(cooldown <= 0){
+      clearInterval(timer);
+      btn.disabled = false; btn.textContent = '重新获取';
+    }else{
+      btn.textContent = cooldown + 's 后重发';
+    }
+  }, 1000);
+  btn.textContent = sec + 's 后重发';
+}
+
+/* ── 下一步 / 提交 ── */
+async function next(){
+  const email = $('#email').value.trim();
+  const code  = $('#code').value.trim();
+
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ showAlert('请填写正确的邮箱地址'); return; }
+  if(code.length !== 6){ showAlert('请输入 6 位验证码'); $('#code').focus(); return; }
+
+  if(stage === 1){
+    // 验证码格式对就进入下一步，真正校验留到提交时（避免验证码被白嫖消耗）
+    stage = 2;
+    $('#pwdField').style.display = '';
+    $('#pwd2Field').style.display = '';
+    $('#step1').className = 'step done';
+    $('#step1').querySelector('.dot').textContent = '✓';
+    $('#line1').classList.add('fill');
+    $('#step2').classList.add('on');
+    $('#nextBtn').textContent = '确认重置密码';
+    hideAlert();
+    $('#newPwd').focus();
+    return;
+  }
+
+  const pwd = $('#newPwd').value;
+  const pwd2 = $('#newPwd2').value;
+  if(pwd.length < 8){ showAlert('新密码至少 8 位'); return; }
+  if(!/[A-Za-z]/.test(pwd) || !/[0-9]/.test(pwd)){ showAlert('密码需同时包含字母和数字'); return; }
+  if(pwd !== pwd2){ showAlert('两次输入的密码不一致'); return; }
+
+  const btn = $('#nextBtn'); loading(btn, true);
+  try{
+    const ret = await post('/api/memo/reset_password', {email, code, password: pwd});
+    if(ret.code === 0){
+      showDone();
+    }else{
+      showAlert(ret.msg || '重置失败');
+      loading(btn, false);
+      // 验证码出错就退回第一步重新获取
+      if(/验证码/.test(ret.msg || '')) backToStage1();
+    }
+  }catch(e){
+    showAlert('网络异常，请稍后重试'); loading(btn, false);
+  }
+}
+
+function backToStage1(){
+  stage = 1;
+  $('#pwdField').style.display = 'none';
+  $('#pwd2Field').style.display = 'none';
+  $('#step1').className = 'step on';
+  $('#step1').querySelector('.dot').textContent = '1';
+  $('#line1').classList.remove('fill');
+  $('#step2').classList.remove('on');
+  $('#nextBtn').textContent = '下一步';
+  $('#code').value = '';
+}
+
+function showDone(){
+  $('#stage-main').classList.remove('active');
+  const d = $('#stage-done');
+  d.classList.remove('active'); void d.offsetWidth; d.classList.add('active');
+  let n = 3;
+  const el = $('#cdNum');
+  const t = setInterval(()=>{
+    n--; el.textContent = n;
+    if(n <= 0){ clearInterval(t); location.href = '/memo_login.html'; }
+  }, 1000);
+}
+
+$('#sendBtn').onclick = sendCode;
+$('#nextBtn').onclick = next;
+$('#goLoginBtn').onclick = ()=> location.href = '/memo_login.html';
+$('#email').addEventListener('keydown', e=>{ if(e.key === 'Enter') $('#code').focus(); });
+$('#code').addEventListener('keydown', e=>{ if(e.key === 'Enter') next(); });
+$('#newPwd').addEventListener('keydown', e=>{ if(e.key === 'Enter') $('#newPwd2').focus(); });
+$('#newPwd2').addEventListener('keydown', e=>{ if(e.key === 'Enter') next(); });
+</script>
+</body>
+</html>
