@@ -29,6 +29,15 @@ WEB_PORT = 8000
 MCP_INTERNAL_PORT = 0          # 0 = 自动选空闲端口
 MCP_PATH_PREFIX = "/mcp"
 
+# 上游超时按场景区分（SSE/流式长连接不能提前断，普通调用不该等太久）。
+# 注意：urllib.request 的 timeout 只接受单个数字，传 (connect, read) 元组
+# 会直接抛 TypeError —— 那是 httpx/requests 的用法（2026-10-29 实测踩到，
+# 表现为 MCP 全部 502）。所以这里只能给单值，取该场景的上界。
+# 统一给 300s 的问题：upstream 卡死时每个请求占住 waitress 线程 5 分钟，
+# 线程池只有 8 个，几个卡死请求就能把服务拖到不可用。
+MCP_READ_TIMEOUT = 60.0
+MCP_STREAM_READ_TIMEOUT = 300.0
+
 
 def pick_port():
     s = socket.socket()
@@ -137,8 +146,12 @@ class MCPForwarder:
         headers["Host"] = f"127.0.0.1:{self.up}"
 
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        # 流式请求（SSE / Streamable HTTP）要用长读超时，否则正常的长连接被提前断
+        accept = (headers.get("Accept") or "").lower()
+        streaming = "text/event-stream" in accept
+        read_tmo = MCP_STREAM_READ_TIMEOUT if streaming else MCP_READ_TIMEOUT
         try:
-            resp = self.opener.open(req, timeout=300)
+            resp = self.opener.open(req, timeout=read_tmo)
             status = resp.status
             raw = resp.read()
             out_headers = [(k, v) for k, v in resp.headers.items()

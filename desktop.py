@@ -270,7 +270,7 @@ def _watch_parent():
                 try:
                     log("[sidecar] 父进程已退出，自动关闭")
                 except Exception:
-                    pass
+                    pass          # 日志写失败无所谓：下一行就 _exit，进程即将消失
                 os._exit(0)
 
     threading.Thread(target=loop, daemon=True, name="parent-guard").start()
@@ -368,8 +368,10 @@ def main():
             if wait_ready(port):
                 try:
                     webbrowser.open(url)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 浏览器打不开不是致命问题（用户可以手动输入地址），
+                    # 但必须留痕：否则「界面没弹出」排查起来毫无线索
+                    log(f"[browser] 自动打开失败：{type(exc).__name__}: {exc}；请手动访问 {url}")
         threading.Thread(target=open_when_ready, daemon=True).start()
 
     if args.no_tray:

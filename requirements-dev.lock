@@ -1,0 +1,27 @@
+# 打包 / 开发工具依赖（可选，运行本身不需要）
+#
+# 用途：
+#   pip install -r requirements-dev.lock   # 打包 exe、托盘模式、SSH 部署脚本
+#
+# 与 requirements.lock 的关系：在其基础上追加以下的包。
+# 安装顺序：先 requirements.lock，再本文件。
+
+# 打包
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+
+# Windows 系统托盘（桌面版桌面壳用；sidecar 版不需要）
+pystray==0.19.5
+pillow==13.0.0
+
+# 运维 / 测试脚本（跳板机部署、进程守护验证）
+paramiko==5.1.0
+bcrypt==5.0.0
+PyNaCl==1.6.2
+cffi==2.1.1
+pycparser==3.12
+psutil==7.2.2
+invoke==3.0.3

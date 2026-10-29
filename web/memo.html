@@ -1633,7 +1633,9 @@ function renderHuangli(ds){
     if(!arr.length) return '诸事不宜';
     return arr.slice(0, 12).map(esc).join('　');
   };
+  // cut() 内部对每项已 esc()，末尾只拼数字（数组长度）
   $('#hlYi').innerHTML = cut(li.yi) + (li.yi.length > 12 ? '<span style="opacity:.6"> …等 ' + li.yi.length + ' 项</span>' : '');
+  // 同上：cut() 已转义，仅拼数字
   $('#hlJi').innerHTML = cut(li.ji) + (li.ji.length > 12 ? '<span style="opacity:.6"> …等 ' + li.ji.length + ' 项</span>' : '');
 
   let foot = '';
@@ -1644,6 +1646,7 @@ function renderHuangli(ds){
             li.others.slice(0, 3).map(esc).join('、') + '</b>';
   }
   if(!foot) foot = '黄历为传统民俗文化内容，仅供参考。';
+  // foot 由上方内部常量拼接而成（节气/节日名走 esc），无用户输入
   $('#hlFoot').innerHTML = foot + '<br><span style="opacity:.72">黄历为传统民俗文化内容，仅供参考。</span>';
 }
 
@@ -2701,6 +2704,7 @@ async function loadPoints(page){
 
     if(!list.length){
       box.dataset.loaded = '1';
+      // 纯静态文案拼接，无变量
       box.innerHTML = '<div class="empty">还没有积分记录<br>注册即送 7 天体验会员 + ' +
                       '体验积分，开通套餐后还会继续到账</div>';
       return;
@@ -2770,6 +2774,7 @@ async function loadVipPlans(){
     const cWeek = (d.point_cost || {}).weekly || 12;
     const pnote = $('#vipPointNote');
     if(pnote && cur.points){
+      // cur.points / cDaily / cWeek 均为 Number，不拼字符串
       pnote.innerHTML = '本套餐到账 <b>' + cur.points + '</b> 积分，' +
         '约可生成 <b>' + Math.floor(cur.points / cDaily) + '</b> 篇日报，或 <b>' +
         Math.floor(cur.points / cWeek) + '</b> 篇周报（日报 ' + cDaily + ' 积分 / 周报 ' + cWeek + ' 积分）。';
@@ -2777,6 +2782,7 @@ async function loadVipPlans(){
     const g = giftDays();
     const gn = $('#vipGiftNote');
     // 只有带赠送天数的套餐才补这句；月卡没有赠送，句子要保持通顺
+    // g = giftDays() 返回数字
     if(gn) gn.innerHTML = g ? '，并<b>额外赠送 ' + g + ' 天</b>' : '';
     if(state.isMember){
       $('#vipApply').style.display = 'none';
@@ -3553,6 +3559,7 @@ async function loadMemberReports(page){
     const list = d.list || [];
     MEM_D.page = Number(d.page || 1);
     if(!list.length){
+      // 三元表达式两侧都是硬编码常量
       box.innerHTML = '<div class="empty">' + (MEM_D.kind ? '这个分类下还没有汇报' : 'TA 还没有发出过日报 / 周报') + '</div>';
       $('#mmPager').innerHTML = '';
       return;
@@ -4387,16 +4394,20 @@ function applyAiTip(on, opt){
 
   tip.className = manual ? 'ai-tip off' : 'ai-tip';
   if(!on){
+    // 静态文案，无变量
     tip.innerHTML = '⚠️ <b>AI 功能未启用</b>：可以直接在下框<b>手动输入</b>日报/周报，保存和发送都能正常用。' +
       '<br>需要自动生成时，请联系管理员在后台「AI 配置」里启用。';
   }else if(short){
+    // cost / pts 均为 Number
     tip.innerHTML = '⚠️ <b>积分不足</b>：本次生成需要 <b>' + cost + '</b> 积分，当前只剩 <b>' + pts + '</b>。' +
       '<br>可以直接<b>手动输入</b>后发送；想继续用 AI，点会员入口续费（周卡 5 元 / 月卡 19 元 / 高级月卡 50 元）。';
   }else if(manualOnly || !useAi){
     tip.className = 'ai-tip';    // 手写模式不是错误，别用红底
+    // 静态文案，无变量
     tip.innerHTML = '✍️ <b>手写模式</b>：本次<b>不调用大模型、不扣积分</b>，直接在下框写就行，保存和发送都正常。' +
       '<br>想自动生成，把上方「用大模型自动生成」勾上。';
   }else{
+    // 静态文案 + Number 变量 cost/pts
     tip.innerHTML = '生成的内容是<b>草稿</b>，你可以随意修改后再发送。' +
       '<br>本次生成消耗 <b>' + cost + '</b> 积分，当前余额 <b>' + pts + '</b>。';
   }
@@ -4600,8 +4611,12 @@ async function genReport(force, manualOnly){
           ? '积分不足（剩 ' + (d.points || 0) + '，本次需 ' + (d.cost || cost) + '），请自行输入'
           : '手写模式：未调用大模型，未扣积分';
       // AI 关闭 / 积分不足用红字；主动手写是正常选择，用普通色
+      // cls 要拼进 class="" 属性，只允许这两个已知值：它现在虽是内部常量，
+      // 但属性位拼接最容易被后来的改动喂进用户数据，这里显式收紧。
       const cls = (!aiOn || d.shortPoints) ? 'warn' : 'wait';
-      info.innerHTML = '<span class="' + cls + '">' + why + '</span>' +
+      const clsSafe = (cls === 'warn' || cls === 'wait') ? cls : 'wait';
+      // clsSafe 已白名单收紧；why 由上方内部常量+Number 拼成；startDate 为服务端 strftime 产物
+      info.innerHTML = '<span class="' + clsSafe + '">' + why + '</span>' +
         (r && r.startDate ? ' · ' + r.startDate +
           (kindNow === 'weekly' && r.endDate ? ' ~ ' + r.endDate : '') : '');
       $('#repModel').textContent = '';
@@ -4614,6 +4629,7 @@ async function genReport(force, manualOnly){
     curReport = r;
     $('#repTitle').value = r.title || '';
     $('#repContent').value = r.content || '';
+    // r.startDate 是服务端 strftime 产物（YYYY-MM-DD），非自由文本
     info.innerHTML = '<span class="ok">✅ AI 已生成完毕</span> · ' + r.startDate +
                      (kindNow === 'weekly' ? ' ~ ' + r.endDate : '') +
                      (d.cached ? '（已有内容，未重复生成）'
@@ -4643,7 +4659,8 @@ $('#repSave').onclick = async () => {
     if(ret.code === 0){
       toast('已保存', 'ok');
       const info = $('#repInfo');
-      info.innerHTML = info.innerHTML.replace(/ · <b>已保存<\/b>/g, '') + ' · <b>已保存</b>';
+      // 只对自身既有 HTML 做字符串替换，追加的是常量
+    info.innerHTML = info.innerHTML.replace(/ · <b>已保存<\/b>/g, '') + ' · <b>已保存</b>';
     }
     else toast(ret.msg || '保存失败', 'err');
   }catch(e){ toast('保存失败', 'err'); }

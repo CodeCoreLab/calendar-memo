@@ -11,6 +11,8 @@
 
 import io
 import json
+import json as _json
+import logging
 import os
 import re
 import sqlite3
@@ -58,6 +60,57 @@ app = Flask(__name__, static_folder=os.path.join(WEB_DIR, "static"), static_url_
 app.secret_key = os.environ.get("MEMO_SECRET", "memo-local-dev-secret-please-change")
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
+# ─────────── 结构化日志 ───────────
+# 为什么自己写：只有一个诉求——「出问题能按 trace_id 把一次请求的所有日志串起来」。
+# 引 structlog/loguru 要多一个依赖、多一层配置，本地单机场景不划算。
+# 输出格式：一行一个 JSON 对象，既有 level/timestamp，也带 trace_id 与自定义字段。
+# 兼容：本地开发时同时保留人类可读的文本（LOG_JSON=0 关闭 JSON）。
+
+LOG_JSON = os.environ.get("LOG_JSON", "1") != "0"
+_logger = logging.getLogger("memo")
+if not _logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(_h)
+    _logger.setLevel(logging.INFO)
+    _logger.propagate = False
+
+
+def log_event(level, event, **fields):
+    """写一条结构化日志。event 用点号分段（如 auth.login_failed）便于过滤。"""
+    rec = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "level": level,
+        "event": event,
+    }
+    # trace_id 从请求上下文取（Web 请求）；非请求上下文（housekeeping）为空
+    tid = ""
+    try:
+        tid = getattr(g, "trace_id", "") or ""
+    except Exception:
+        tid = ""
+    if tid:
+        rec["trace_id"] = tid
+    if fields:
+        rec.update(fields)
+    if LOG_JSON:
+        try:
+            line = _json.dumps(rec, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            line = f"{rec['ts']} {level} {event} {fields}"
+    else:
+        line = f"{rec['ts']} {level} {event} " + " ".join(f"{k}={v}" for k, v in fields.items())
+    _logger.log(getattr(logging, level, logging.INFO), line)
+
+
+def log_warn(event, **fields):
+    log_event("WARNING", event, **fields)
+
+
+def log_error(event, **fields):
+    log_event("ERROR", event, **fields)
+
+
 DT_FMT = "%Y-%m-%d %H:%M"
 DATE_FMT = "%Y-%m-%d"
 
@@ -82,6 +135,7 @@ PWD_BLACKLIST = {
 
 LOGIN_MAX_FAIL = 5
 LOGIN_LOCK_SEC = 15 * 60
+LOGIN_LOCK_EXTRA = 3       # 锁定期内仍允许的次数（给本人留后门，但不给攻击者无限窗口）
 RESET_CODE_TTL_SEC = 10 * 60       # 找回密码验证码有效期
 LOGIN_FAIL = {}
 LOGIN_LOCK = threading.Lock()      # waitress 多线程下保护 LOGIN_FAIL
@@ -136,6 +190,10 @@ CREATE TABLE IF NOT EXISTS events (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id);
+-- 日历/列表按时间范围查（配合 day_bounds/month_bounds 的半开区间，能走索引）
+CREATE INDEX IF NOT EXISTS idx_events_user_time ON events(user_id, start_time);
+-- 归档过滤是高频组合条件
+CREATE INDEX IF NOT EXISTS idx_events_user_arch ON events(user_id, archived, start_time);
 
 CREATE TABLE IF NOT EXISTS tags (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -297,6 +355,7 @@ CREATE TABLE IF NOT EXISTS visits (
   title TEXT DEFAULT '',
   time TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_visits_time ON visits(time);
 
 CREATE TABLE IF NOT EXISTS api_tokens (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +377,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
   response TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_idem_time ON idempotency(created_at);
 """
 
 
@@ -353,24 +413,36 @@ def _login_key(username):
 
 
 def login_locked(username):
-    """失败 5 次锁 15 分钟；按用户名+IP 记录，避免误锁他人账号。"""
+    """返回 (剩余秒数, 是否硬锁)。
+
+    分两级，缺一不可：
+    - 软锁（剩余秒数 > 0，硬锁 False）：仍校验密码，密码正确即放行。
+      目的是「攻击者乱试不能把主人锁在门外」。
+    - 硬锁（锁定期内错误尝试已达 LOGIN_LOCK_EXTRA 上限）：连正确密码也不放行。
+      没有这一级，锁定期会变成攻击者的无限尝试窗口（实测可连试无数次、试中就登录）。
+    """
     key = _login_key(username)
     with LOGIN_LOCK:
         rec = LOGIN_FAIL.get(key)
     if not rec:
-        return 0
-    cnt, last = rec
+        return 0, False
+    cnt, last = rec[0], rec[1]
+    extra = rec[2] if len(rec) > 2 else 0
     if cnt < LOGIN_MAX_FAIL:
-        return 0
+        return 0, False
     left = LOGIN_LOCK_SEC - (datetime.now() - last).total_seconds()
-    return int(left) if left > 0 else 0
+    if left <= 0:
+        return 0, False
+    return int(left), extra > LOGIN_LOCK_EXTRA
 
 
 def login_fail(username):
     key = _login_key(username)
     with LOGIN_LOCK:
-        cnt, _ = LOGIN_FAIL.get(key, (0, datetime.now()))
-        LOGIN_FAIL[key] = (cnt + 1, datetime.now())
+        rec = LOGIN_FAIL.get(key, (0, datetime.now(), 0))
+        cnt = rec[0]
+        extra = (rec[2] if len(rec) > 2 else 0) + 1 if cnt >= LOGIN_MAX_FAIL else 0
+        LOGIN_FAIL[key] = (cnt + 1, datetime.now(), extra)
         if len(LOGIN_FAIL) > 2000:      # 防内存膨胀
             now = datetime.now()
             for k, (c, t) in list(LOGIN_FAIL.items()):
@@ -442,6 +514,24 @@ def parse_dt(s):
     return None
 
 
+def day_bounds(day_str):
+    """'YYYY-MM-DD' → (下界含, 上界不含)，供 SQL 范围查询。
+
+    为什么不用 substr(start_time,1,10)=?：对列套函数会让索引失效，行数上来后退化成
+    全表扫。这里下界取 10 字符前缀本身，所以 'YYYY-MM-DD'、'YYYY-MM-DD HH:MM'、
+    'YYYY-MM-DDTHH:MM' 三种存储都能命中（字符串比较下短串更小，长串更大）。
+    """
+    d0 = datetime.strptime(day_str, DATE_FMT)
+    return day_str, (d0 + timedelta(days=1)).strftime(DT_FMT)
+
+
+def month_bounds(year, month):
+    """'YYYY-MM' → (下界含, 上界不含)，规则同 day_bounds。"""
+    lower = f"{year:04d}-{month:02d}"
+    upper = f"{year + 1:04d}-01" if month == 12 else f"{year:04d}-{month + 1:02d}"
+    return lower, upper
+
+
 def fmt_dt(v):
     return v.strftime(DT_FMT) if isinstance(v, datetime) else str(v or "")
 
@@ -470,8 +560,10 @@ def clear_token_cache():
     for fn in list(TOKEN_CACHE_HOOKS):
         try:
             fn()
-        except Exception:
-            pass
+        except Exception as exc:
+            # 缓存没清掉只影响最长 60 秒的有效性，不该中断调用方，但必须留痕
+            log_warn("token.cache_clear_failed", hook=getattr(fn, "__name__", "?"),
+                     err=f"{type(exc).__name__}: {exc}")
 
 
 def hash_token(raw):
@@ -507,6 +599,32 @@ def token_from_request():
                  (now_str(), row["id"]))
     conn.commit()
     return user, row
+
+
+@app.before_request
+def _assign_trace_id():
+    """给每个请求分配 trace_id，并记录起始时间（用于慢请求告警）。
+
+    trace_id 优先沿用入站的 X-Request-Id（让上游链路能串起来），否则本地生成。
+    """
+    g.trace_id = (request.headers.get("X-Request-Id") or "").strip()[:32] or secrets.token_hex(8)
+    g.t0 = time.time()
+
+
+@app.after_request
+def _log_slow_request(resp):
+    """只记慢请求与非 2xx，避免正常流量把日志刷满。"""
+    try:
+        cost = time.time() - getattr(g, "t0", time.time())
+        status = resp.status_code
+        if cost >= 1.0 or status >= 400:
+            log_warn("http.request",
+                     method=request.method, path=request.path[:120],
+                     status=status, ms=int(cost * 1000))
+        resp.headers["X-Request-Id"] = getattr(g, "trace_id", "")
+    except Exception:
+        pass          # 日志失败绝不能影响响应
+    return resp
 
 
 @app.before_request
@@ -840,23 +958,33 @@ def api_login():
     password = d.get("password") or ""
     if not username or not password:
         return err("请输入用户名和密码")
-    left = login_locked(username)
+    left, hard = login_locked(username)
     if left:
-        # 锁定期内仍校验密码：密码正确即视为本人，直接解锁并放行，
-        # 避免「攻击者乱试把主人也锁在门外」
+        wait = left // 60 + 1
+        if hard:
+            # 硬锁：不再校验密码，攻击者连「试」的机会都没有
+            log_warn("auth.login_hard_locked", username=username,
+                     ip=request.remote_addr or "", wait_min=wait)
+            return err(f"密码错误次数过多，请 {wait} 分钟后再试")
+        # 软锁：仍校验密码，正确即视为本人放行 —— 防攻击者把主人锁在门外
         row = db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         if row and check_password_hash(row["pwd_hash"], password):
             login_success(username)
             session["uid"] = row["id"]
             return ok({"nickname": row["nickname"] or row["username"],
                        "username": row["username"]}, "登录成功")
-        return err(f"密码错误次数过多，请 {left // 60 + 1} 分钟后再试")
+        # 软锁期的失败也要计数，配额才会推进到硬锁
+        login_fail(username)
+        return err(f"密码错误次数过多，请 {wait} 分钟后再试")
     u = db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if not u or not check_password_hash(u["pwd_hash"], password):
         login_fail(username)
+        log_warn("auth.login_failed", username=username, ip=request.remote_addr or "")
         return err("用户名或密码错误")
     login_success(username)
     session["uid"] = u["id"]
+    log_event("INFO", "auth.login_ok", username=username, uid=u["id"],
+              ip=request.remote_addr or "")
     return ok({"nickname": u["nickname"] or u["username"], "username": u["username"]}, "登录成功")
 
 
@@ -980,6 +1108,8 @@ def api_reset_password():
         return err("该邮箱未注册")
     conn.execute("UPDATE users SET pwd_hash = ? WHERE id = ?", (generate_password_hash(pwd), u["id"]))
     conn.commit()
+    log_warn("auth.password_reset", uid=u["id"], email=email,
+             ip=request.remote_addr or "")
     return ok(None, "密码已重置，请用新密码登录")
 
 
@@ -1034,8 +1164,9 @@ def api_events():
         sql += " AND level = ?"
         params.append(level)
     if date_filter:
-        sql += " AND substr(start_time, 1, 10) = ?"
-        params.append(date_filter)
+        lo, hi = day_bounds(date_filter)
+        sql += " AND start_time >= ? AND start_time < ?"
+        params += [lo, hi]
     if tag_id.isdigit():
         sql += " AND id IN (SELECT event_id FROM event_tag WHERE tag_id = ?)"
         params.append(int(tag_id))
@@ -1303,8 +1434,9 @@ def api_calendar():
     prefix = f"{year:04d}-{month:02d}"
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM events WHERE user_id=? AND archived=0 AND substr(start_time,1,7)=?",
-        (u["id"], prefix),
+        "SELECT * FROM events WHERE user_id=? AND archived=0 "
+        "AND start_time >= ? AND start_time < ?",
+        (u["id"], *month_bounds(year, month)),
     ).fetchall()
     marks = {}
     for r in rows:
@@ -2290,8 +2422,9 @@ def report_period(kind, date_s):
 def build_report_content(conn, uid, kind, start_s, end_s):
     """本地模板汇总：不调用外部大模型，按日程记录生成可读草稿。"""
     rows = conn.execute(
-        "SELECT * FROM events WHERE user_id=? AND archived=0 AND substr(start_time,1,10) "
-        "BETWEEN ? AND ? ORDER BY start_time", (uid, start_s, end_s)).fetchall()
+        "SELECT * FROM events WHERE user_id=? AND archived=0 "
+        "AND start_time >= ? AND start_time < ? ORDER BY start_time",
+        (uid, start_s, day_bounds(end_s)[1])).fetchall()
     if not rows:
         return (f"{'周报' if kind == 'weekly' else '日报'}（{start_s}）\n\n"
                 f"本{'周' if kind == 'weekly' else '日'}没有记录到日程，建议补充后再汇总。"), 0, 0, 0
@@ -3017,11 +3150,11 @@ def ai_events():
         sql += " AND level = ?"
         params.append(level)
     if date_from:
-        sql += " AND substr(start_time,1,10) >= ?"
+        sql += " AND start_time >= ?"
         params.append(date_from)
     if date_to:
-        sql += " AND substr(start_time,1,10) <= ?"
-        params.append(date_to)
+        sql += " AND start_time < ?"
+        params.append(day_bounds(date_to)[1])
     if kw:
         sql += " AND (title LIKE ? OR content LIKE ? OR remark LIKE ?)"
         params += [f"%{kw}%"] * 3
@@ -3364,8 +3497,9 @@ def ai_agenda():
     for i in range(days):
         day = (base.date() + timedelta(days=i)).strftime(DATE_FMT)
         rows = sort_events(conn.execute(
-            "SELECT * FROM events WHERE user_id=? AND archived=0 AND substr(start_time,1,10)=?",
-            (u["id"], day)).fetchall())
+            "SELECT * FROM events WHERE user_id=? AND archived=0 "
+            "AND start_time >= ? AND start_time < ?",
+            (u["id"], *day_bounds(day))).fetchall())
         out.append({
             "date": day,
             "weekday": "一二三四五六日"[date.fromisoformat(day).weekday()],
@@ -3510,8 +3644,9 @@ def ai_calendar():
         return ai_err("month 需在 1~12", 422, "invalid")
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM events WHERE user_id=? AND archived=0 AND substr(start_time,1,7)=?",
-        (u["id"], f"{year:04d}-{month:02d}")).fetchall()
+        "SELECT * FROM events WHERE user_id=? AND archived=0 "
+        "AND start_time >= ? AND start_time < ?",
+        (u["id"], *month_bounds(year, month))).fetchall()
     marks = {}
     for r in rows:
         d = str(r["start_time"])[:10]
@@ -3601,6 +3736,17 @@ def ai_schema():
 
 # ─────────── 运维辅助 ───────────
 
+VISIT_TTL_DAYS = 180           # 访问记录保留天数（只作站点统计，不需要长期留存）
+IDEM_TTL_DAYS = 3              # 幂等键保留天数（与客户端重试窗口匹配）
+
+
+def cleanup_visits(conn, ttl_days=VISIT_TTL_DAYS):
+    """删除超过 TTL 的访问记录。此前 visits 只增不删，长期会无限增长。"""
+    cutoff = (datetime.now() - timedelta(days=ttl_days)).strftime(DT_FMT)
+    cur = conn.execute("DELETE FROM visits WHERE time < ?", (cutoff,))
+    return cur.rowcount
+
+
 def cleanup_uploads(ttl_days=UPLOAD_TTL_DAYS):
     """删除超过 TTL 的凭证图，避免长期累积。返回删除数量。"""
     cutoff = datetime.now().timestamp() - ttl_days * 86400
@@ -3679,15 +3825,16 @@ def run_housekeeping():
 
     返回各项清理数量，便于日志核对。
     """
-    stats = {"uploads": 0, "idempotency": 0, "tokens": 0}
+    stats = {"uploads": 0, "idempotency": 0, "tokens": 0, "visits": 0}
     try:
         stats["uploads"] = cleanup_uploads()
-    except OSError:
-        pass
+    except OSError as exc:
+        stats["uploadsError"] = f"{type(exc).__name__}: {exc}"
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("PRAGMA busy_timeout = 5000")
         stats["idempotency"] = idem_cleanup(conn)
+        stats["visits"] = cleanup_visits(conn)
         # 90 天未使用的 Token 自动吊销，减少僵尸凭据
         cutoff = (datetime.now() - timedelta(days=90)).strftime(DT_FMT)
         cur = conn.execute(

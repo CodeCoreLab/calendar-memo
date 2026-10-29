@@ -16,7 +16,12 @@ start.bat
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r requirements.txt
+
+# 二选一：
+#   requirements.lock      —— 精确锁定，复现开发环境（推荐）
+#   requirements.txt       —— 宽松下限，便于依赖升级
+.venv/Scripts/python.exe -m pip install -r requirements.lock
+
 .venv/Scripts/python.exe seed.py            # 建表 + 演示数据
 .venv/Scripts/python.exe serve.py           # Web + REST + MCP 同端口
 ```
@@ -39,6 +44,14 @@ python -m venv .venv
 | `serve.py` | Web + REST + MCP(HTTP) 单端口 8000 | **推荐**，一个地址全搞定 |
 | `app.py` | Web + REST（waitress） | 不需要 MCP 时 |
 | `mcp_server.py` | MCP（stdio） | Claude Desktop / Cursor 等本地客户端 |
+
+依赖文件：
+
+| 文件 | 用途 |
+|------|------|
+| `requirements.lock` | 运行时依赖精确锁定（含全部传递依赖），复现开发环境 |
+| `requirements.txt` | 运行时依赖宽松下限，便于升级 |
+| `requirements-dev.lock` | 打包 exe / 托盘模式 / 运维脚本的额外依赖（可选） |
 
 ---
 
@@ -214,9 +227,17 @@ Authorization: Bearer memo_你的token
 ### 5. 验证
 
 ```bash
+# 免依赖、直接跑（各自建临时数据目录，不碰 data/memo.db）
+.venv/Scripts/python.exe tests_security.py     # 鉴权边界 + 越权 + P0 修复回归（34 项）
+.venv/Scripts/python.exe tests_backup.py       # 备份/恢复 + 失败不破坏数据（27 项）
+.venv/Scripts/python.exe tests_xss_static.py   # 前端 innerHTML 转义静态检查（6 项）
+
+# 需要先起服务并签发 Token
 .venv/Scripts/python.exe tests_mcp.py <token>                                   # stdio 16 项
 .venv/Scripts/python.exe tests_mcp_http.py http://127.0.0.1:8000/mcp <token>    # HTTP 7 项
 ```
+
+三套免依赖测试都以「攻击/异常必须失败」为断言口径，不只看正常路径通过。
 
 ---
 
@@ -247,8 +268,13 @@ app.py              Web + REST（含 /api/ai/*、鉴权、密码策略）
 serve.py            单端口统一服务（Web + REST + MCP HTTP）
 mcp_server.py       MCP Server（stdio / HTTP，15 工具）
 seed.py             初始化数据库与演示数据
+tests_security.py   鉴权边界 / 横向越权 / 登录防爆破回归
+tests_backup.py     备份恢复 / 非法输入拒绝 / 失败后原库完好
+tests_xss_static.py 前端 innerHTML 转义静态检查（含 JS 语法编译）
 tests_mcp.py        MCP stdio 端到端测试（真实协议）
 tests_mcp_http.py   MCP HTTP 端到端测试
+requirements.lock   运行时依赖精确锁定（复现环境用）
+requirements-dev.lock 打包/托盘/运维脚本依赖
 web/memo.html       主页面（与原站 CSS 零差异）
 web/memo_login.html 登录/注册页
 web/memo_reset.html 找回密码页
