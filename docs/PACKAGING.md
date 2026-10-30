@@ -534,3 +534,94 @@ dist/日历备忘录-1.0.0-安装包.exe   25.3MB（NSIS 安装包，含托盘�
 
 文件结构（安装后 `%LOCALAPPDATA%\cn.local.memo\`）：
 `memo-desktop.exe`(2.9MB) / `memo-server.exe`(24MB) / `WebView2Loader.dll` / `data\`
+
+---
+
+## 十二、改为 exe 直接启动（2026-10-30）
+
+### 12.1 原有问题
+
+`启动.bat` 的判断顺序是「先找 `dist\日历备忘录\日历备忘录.exe`，找不到回退到 `.venv\python.exe`」。
+但 `dist/日历备忘录/` 是 PyInstaller 的**中间产物目录**，清理时被删过 ——
+此时 bat 会静默回退到 `.venv`，在用户机器上（没有 venv）必然失败，
+表现就是**双击 bat 黑框一闪即退**。
+
+实测确认：清理后 `dist/日历备忘录/` 不存在，bat 的 exe 分支永远走不到。
+
+### 12.2 交付形态：双击 exe，不用 bat
+
+PyInstaller **onedir** 重新打包，产物自带 CPython 运行时与全部三方库：
+
+```
+日历备忘录/
+├── 日历备忘录.exe      8.2 MB   主程序（双击）
+├── _internal/          68 MB    运行时依赖（必须与 exe 同级）
+├── 使用说明.txt                 结构与排障说明
+├── 启动.bat                     可选，内容只是调 exe（兼容用）
+└── data/                        首次启动自动创建
+```
+
+zip：**30.3 MB / 654 条目**（原 31 MB / 652 条目，新增说明与 bat）。
+
+### 12.3 bat 的启动逻辑已并入 exe
+
+| bat 里的逻辑 | 现在的归属 |
+|------|------|
+| 切工作目录 `cd /d "%~dp0"` | exe 自身用 `sys.executable` 同级定位，不依赖 cwd |
+| 参数透传 `%*` | exe 保留全部参数：`--port` `--no-browser` `--no-mcp` `--no-tray` `--sidecar` `--port-file` `--parent-pid` |
+| 找 exe / 回退源码 | 不需要了：exe 就是入口。`启动.bat` 改为仅兼容入口，优先调 `日历备忘录\日历备忘录.exe` |
+| 首次装依赖（start.bat） | 不需要：运行时已打进 `_internal` |
+| 建 data 目录 | `app.data_dir()` 落到 exe 同级 `data/` |
+| 开浏览器 | 程序内 `webbrowser.open`，失败写 run.log |
+
+### 12.4 无控制台黑框（直接证据）
+
+`memo.spec` 里 `console=False` → PE `Subsystem=2`（GUI）。
+
+运行时枚举 exe 进程的全部窗口类，实测只有：
+
+```
+类=日历备忘录…SystemTrayIcon   可见=False
+类=日历备忘录…SystemTrayIcon   可见=False
+类=IME                         可见=False
+黑框检查: 无 ConsoleWindowClass ✅
+```
+
+即没有任何 `ConsoleWindowClass`，双击不会出现黑框闪屏。
+
+### 12.5 验收（全部实测）
+
+| # | 项 | 结果 |
+|---|----|------|
+| 1 | PE 子系统 | `Subsystem=2`（GUI） |
+| 2 | 双击等效启动（无参数） | 进程存活，端口 8000 可连接 |
+| 3 | data 落在 exe 同级 | `memo.db` / `uploads/` / `run.log` 均生成 |
+| 4 | 首次启动门槛 | `bootstrap → needSetup=True, username=admin` |
+| 5 | 页面 | `/memo_login.html` 200、`/memo.html` 200、`/memo_reset.html` 404 |
+| 6 | 已移除接口 | register / send_code / reset_password 全 404 |
+| 7 | 功能 | 设密码 code=0、建日程 code=0、统计正确 |
+| 8 | **全新路径解压启动** | 解压到 `E:/fresh_extract` 后独立运行成功，证明自包含 |
+| 9 | 无控制台窗口 | 窗口类列表无 `ConsoleWindowClass` |
+| 10 | 托盘 | `SystemTrayIcon` 存在 |
+| 11 | 浏览器渲染（Playwright） | 首启进设置页、设完进主页、新会话只显示登录面板，**控制台 0 错误** |
+| 12 | 退出清理 | `terminate` 后无残留进程 |
+
+### 12.6 使用方式
+
+```
+1. 解压 zip 到任意目录（不要只解 exe，_internal 必须一起）
+2. 双击 日历备忘录.exe
+3. 首次进入：账号 admin，自己设密码（代码里无预设口令）
+4. 关闭：托盘右键退出
+```
+
+数据全在 `data/`，备份/迁移/卸载都只需操作这个目录。
+
+### 12.7 已知限制
+
+| 项 | 说明 |
+|----|------|
+| 仅 Windows | PyInstaller 交叉打包产物，mac 需在 mac 上重打 |
+| 需完整解压 | exe 与 `_internal` 分离即启动失败（run.log 会有 ModuleNotFound） |
+| 未签名 | 杀软可能误报，需加白名单 |
+| 体积 | 68 MB 解压，主要是 CPython + mcp/uvicorn 依赖链。要更小需换 Rust 重写后端（见第十节 Tauri 讨论） |

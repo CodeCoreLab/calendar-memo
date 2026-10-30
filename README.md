@@ -8,6 +8,18 @@
 
 ## 快速启动
 
+### 普通用户（免安装，推荐）
+
+下载 `日历备忘录-Windows-x64.zip`，解压后**双击 `日历备忘录.exe`**。
+不需要装 Python，不需要运行任何 bat。
+
+首次启动：自动打开浏览器 → 账号 `admin` → 设置你自己的密码。
+
+> exe 与 `_internal` 目录必须放在一起；数据全部在 `data/` 目录。
+> 详细说明见包内 `使用说明.txt`。
+
+### 开发者（源码运行）
+
 ```bat
 start.bat
 ```
@@ -276,6 +288,9 @@ tests_mcp.py        MCP stdio 端到端测试（真实协议）
 tests_mcp_http.py   MCP HTTP 端到端测试
 requirements.lock   运行时依赖精确锁定（复现环境用）
 requirements-dev.lock 打包/托盘/运维脚本依赖
+desktop.py          桌面入口（托盘 / 单实例 / exe 主程序）
+memo.spec           PyInstaller 打包配置（onedir, console=False）
+启动.bat            兼容入口（优先调 日历备忘录.exe）
 web/memo.html       主页面（与原站 CSS 零差异）
 web/memo_login.html 登录 / 首次设置密码页
 web/static/lunar.js 农历库
