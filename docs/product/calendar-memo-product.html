@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日历备忘录 · 本地离线日程管理，AI 与 MCP 就绪</title>
+<meta name="description" content="日历备忘录：像素级复刻的单页日历，Flask + SQLite 完全离线运行，内置 AI REST API 与 MCP Server，让大模型直接读写你的日程。">
+<style>
+  :root{
+    --bg-a:#F7F8FC;
+    --bg-b:#EFF1F7;
+    --bg-c:#F6F2F3;
+    --glass:rgba(255,255,255,.66);
+    --glass-strong:rgba(255,255,255,.82);
+    --glass-edge:rgba(255,255,255,.9);
+    --surface:#FFFFFF;
+    --line:rgba(24,28,40,.09);
+    --line-strong:rgba(24,28,40,.16);
+    --text:#191C25;
+    --text-dim:#5D6474;
+    --text-faint:#98A0B0;
+    --cinnabar:#D6412B;
+    --cinnabar-soft:#E8543F;
+    --amber:#F2C14E;
+    --amber-ink:#A8720A;
+    --jade:#0F9B84;
+    --grad-text:linear-gradient(120deg,#D6412B 0%,#E8743F 45%,#DFA21F 100%);
+    --mono:"Cascadia Code","SF Mono",Consolas,"Courier New",monospace;
+    --sans:"Segoe UI","Microsoft YaHei",-apple-system,sans-serif;
+    --serif:"Kaiti SC",KaiTi,"STKaiti","楷体",serif;
+    --shadow-card:0 24px 60px rgba(30,36,54,.10),0 4px 14px rgba(30,36,54,.06);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    background:linear-gradient(165deg,var(--bg-a) 0%,var(--bg-b) 55%,var(--bg-c) 100%);
+    background-attachment:fixed;
+    color:var(--text);
+    font-family:var(--sans);
+    font-size:16px;
+    line-height:1.7;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  ::selection{background:rgba(232,84,63,.85);color:#fff}
+  a{color:inherit}
+
+  /* ---------- 背景光斑（毛玻璃氛围） ---------- */
+  .blob{position:fixed;border-radius:50%;filter:blur(90px);z-index:-1;pointer-events:none}
+  .blob-1{width:52vw;height:52vw;top:-16vw;left:-12vw;background:rgba(232,84,63,.26)}
+  .blob-2{width:46vw;height:46vw;top:30vh;right:-14vw;background:rgba(242,193,78,.32)}
+  .blob-3{width:40vw;height:40vw;bottom:-10vw;left:8vw;background:rgba(95,191,165,.22)}
+
+  /* ---------- 顶部导航 ---------- */
+  header{
+    position:fixed;top:0;left:0;right:0;z-index:50;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:14px 40px;
+    background:rgba(255,255,255,.6);
+    backdrop-filter:blur(20px) saturate(1.4);
+    -webkit-backdrop-filter:blur(20px) saturate(1.4);
+    border-bottom:1px solid rgba(255,255,255,.7);
+    box-shadow:0 1px 0 rgba(24,28,40,.04);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.04em}
+  .brand .dot{width:10px;height:10px;background:var(--cinnabar);border-radius:2px;transform:rotate(45deg)}
+  nav{display:flex;gap:28px;font-size:14px;color:var(--text-dim)}
+  nav a{text-decoration:none;transition:color .2s}
+  nav a:hover{color:var(--cinnabar)}
+  .nav-cta{
+    font-size:14px;text-decoration:none;color:#1B1508;
+    background:linear-gradient(120deg,#F2C14E,#EBA23A);
+    padding:8px 18px;border-radius:999px;font-weight:600;
+    box-shadow:0 4px 14px rgba(242,193,78,.4);
+    transition:transform .2s, box-shadow .2s;
+  }
+  .nav-cta:hover{transform:translateY(-1px);box-shadow:0 8px 22px rgba(242,193,78,.5)}
+
+  /* ---------- Hero ---------- */
+  .hero{
+    position:relative;
+    min-height:100vh;
+    display:flex;align-items:center;
+    padding:130px 40px 80px;
+    overflow:hidden;
+  }
+  #particles{
+    position:absolute;inset:0;width:100%;height:100%;
+    display:block;
+  }
+  .hero-inner{
+    position:relative;z-index:2;
+    max-width:1200px;margin:0 auto;width:100%;
+    display:grid;grid-template-columns:1.1fr .9fr;gap:64px;align-items:center;
+  }
+  .kicker{
+    display:inline-flex;align-items:center;gap:10px;
+    font-family:var(--mono);font-size:12px;letter-spacing:.22em;
+    color:var(--amber-ink);text-transform:uppercase;
+    background:rgba(255,255,255,.55);
+    border:1px solid rgba(242,193,78,.55);
+    backdrop-filter:blur(10px);
+    padding:6px 16px;border-radius:999px;
+    margin-bottom:28px;
+  }
+  .kicker::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--amber)}
+  h1{
+    font-size:clamp(40px,5.4vw,68px);
+    line-height:1.18;font-weight:800;letter-spacing:.01em;
+    margin-bottom:24px;color:#14161E;
+  }
+  h1 .accent{
+    background:var(--grad-text);
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;color:transparent;
+    font-family:var(--serif);font-weight:700;
+  }
+  .grad{
+    background:var(--grad-text);
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;color:transparent;
+  }
+  .hero-sub{
+    font-size:17px;color:var(--text-dim);max-width:540px;
+    margin-bottom:36px;
+  }
+  .hero-sub strong{color:var(--text);font-weight:600}
+  .cta-row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:48px}
+  .btn{
+    display:inline-flex;align-items:center;gap:8px;
+    padding:14px 28px;border-radius:999px;
+    font-size:15px;font-weight:600;text-decoration:none;
+    transition:transform .2s, box-shadow .2s, background .2s, border-color .2s;
+  }
+  .btn-primary{
+    background:linear-gradient(120deg,#D6412B,#E8743F);
+    color:#fff;
+    box-shadow:0 10px 26px rgba(214,65,43,.32);
+  }
+  .btn-primary:hover{transform:translateY(-2px);box-shadow:0 16px 34px rgba(214,65,43,.42)}
+  .btn-ghost{
+    background:rgba(255,255,255,.6);
+    border:1px solid var(--line-strong);color:var(--text);
+    backdrop-filter:blur(10px);
+  }
+  .btn-ghost:hover{border-color:var(--cinnabar-soft);color:var(--cinnabar);transform:translateY(-2px)}
+  .stats{display:flex;gap:40px;flex-wrap:wrap}
+  .stat b{
+    display:block;font-family:var(--mono);
+    font-size:34px;font-weight:700;line-height:1.2;
+    background:linear-gradient(120deg,#1D2130 30%,#4A5168);
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;color:transparent;
+  }
+  .stat b i{
+    font-style:normal;font-size:22px;vertical-align:6px;margin-left:2px;
+    background:var(--grad-text);
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;color:transparent;
+  }
+  .stat span{font-size:13px;color:var(--text-dim);letter-spacing:.06em}
+
+  /* 日历实体卡片（毛玻璃） */
+  .cal-card{
+    background:var(--glass);
+    border:1px solid var(--glass-edge);
+    border-radius:20px;
+    padding:26px;
+    backdrop-filter:blur(24px) saturate(1.3);
+    -webkit-backdrop-filter:blur(24px) saturate(1.3);
+    box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.8);
+    transform:rotate(1.2deg);
+  }
+  .cal-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:18px}
+  .cal-head h3{font-size:22px;font-weight:700;color:#14161E}
+  .cal-head h3 em{font-style:normal;color:var(--cinnabar);margin-left:8px;font-size:14px;font-family:var(--serif)}
+  .cal-head span{font-family:var(--mono);font-size:12px;color:var(--text-faint)}
+  .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+  .cal-grid .wd{
+    text-align:center;font-size:11px;color:var(--text-faint);
+    padding:4px 0;letter-spacing:.1em;
+  }
+  .cal-grid .d{
+    aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    border-radius:10px;font-family:var(--mono);font-size:13px;color:var(--text-dim);
+    position:relative;transition:background .2s;
+  }
+  .cal-grid .d:hover{background:rgba(255,255,255,.75);box-shadow:0 2px 8px rgba(30,36,54,.08)}
+  .cal-grid .d .lunar{font-size:9px;opacity:.7;font-family:var(--sans)}
+  .cal-grid .d.today{
+    background:linear-gradient(140deg,#D6412B,#E8743F);
+    color:#fff;font-weight:700;
+    box-shadow:0 6px 16px rgba(214,65,43,.35);
+  }
+  .cal-grid .d.today .lunar{opacity:.92}
+  .cal-grid .d.mark{color:var(--amber-ink);font-weight:600}
+  .cal-grid .d.mark::after{
+    content:"";position:absolute;bottom:5px;width:4px;height:4px;border-radius:50%;background:var(--amber);
+  }
+  .cal-grid .d.dim{opacity:.35}
+  .cal-events{margin-top:18px;display:flex;flex-direction:column;gap:8px}
+  .ev{
+    display:flex;align-items:center;gap:12px;
+    background:rgba(255,255,255,.7);
+    border:1px solid var(--line);
+    border-left:3px solid var(--jade);
+    padding:10px 14px;border-radius:10px;font-size:13px;
+  }
+  .ev time{font-family:var(--mono);color:var(--text-faint);font-size:12px}
+  .ev .tag{
+    margin-left:auto;font-size:11px;padding:2px 8px;border-radius:999px;
+    background:rgba(242,193,78,.18);color:var(--amber-ink);border:1px solid rgba(242,193,78,.5);
+  }
+  .ev.high{border-left-color:var(--cinnabar-soft)}
+  .ev.high .tag{background:rgba(232,84,63,.12);color:var(--cinnabar);border-color:rgba(232,84,63,.4)}
+
+  /* ---------- 通用 section ---------- */
+  section{padding:110px 40px;position:relative;z-index:1}
+  .wrap{max-width:1120px;margin:0 auto}
+  .sec-label{
+    font-family:var(--mono);font-size:12px;letter-spacing:.28em;
+    color:var(--cinnabar);text-transform:uppercase;margin-bottom:16px;
+    display:flex;align-items:center;gap:14px;
+  }
+  .sec-label::after{content:"";height:1px;width:64px;background:var(--line-strong)}
+  h2{font-size:clamp(28px,3.4vw,42px);font-weight:800;line-height:1.3;margin-bottom:18px;color:#14161E}
+  .sec-desc{color:var(--text-dim);max-width:640px;font-size:16px;margin-bottom:56px}
+  .sec-desc code,.cap p code{
+    font-family:var(--mono);font-size:13px;
+    background:rgba(255,255,255,.75);border:1px solid var(--line-strong);
+    padding:1px 7px;border-radius:5px;color:var(--amber-ink);
+  }
+
+  /* ---------- 能力清单 ---------- */
+  .caps{border-top:1px solid var(--line-strong);background:rgba(255,255,255,.4);
+    backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+    border-radius:16px;padding:0 26px;border:1px solid var(--glass-edge);
+    box-shadow:var(--shadow-card);}
+  .cap{
+    display:grid;grid-template-columns:80px 1fr 1.4fr;gap:32px;
+    padding:34px 8px;border-bottom:1px solid var(--line);
+    align-items:baseline;transition:background .25s;
+  }
+  .cap:last-child{border-bottom:none}
+  .cap:hover{background:rgba(255,255,255,.6);border-radius:10px}
+  .cap .no{font-family:var(--mono);font-size:14px;color:var(--cinnabar);font-weight:700}
+  .cap h3{font-size:20px;font-weight:700;color:#171A23}
+  .cap p{color:var(--text-dim);font-size:15px}
+
+  /* ---------- AI 接口 ---------- */
+  .ai-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+  .panel{
+    background:var(--glass);
+    border:1px solid var(--glass-edge);
+    border-radius:16px;overflow:hidden;
+    backdrop-filter:blur(24px) saturate(1.3);
+    -webkit-backdrop-filter:blur(24px) saturate(1.3);
+    box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.8);
+  }
+  .panel-head{
+    display:flex;align-items:center;gap:10px;
+    padding:14px 20px;border-bottom:1px solid var(--line);
+    font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--text-dim);
+    background:rgba(255,255,255,.45);
+  }
+  .panel-head .led{width:8px;height:8px;border-radius:50%;background:var(--jade);box-shadow:0 0 6px rgba(15,155,132,.6)}
+  .panel pre{
+    padding:22px 20px;font-family:var(--mono);font-size:13px;line-height:1.8;
+    color:#39404F;overflow-x:auto;white-space:pre;
+    background:rgba(252,252,254,.6);
+  }
+  .panel pre .c{color:#98A0B0}
+  .panel pre .k{color:var(--amber-ink);font-weight:600}
+  .panel pre .s{color:#0F7B66}
+  .panel pre .r{color:var(--cinnabar);font-weight:600}
+  .tool-chips{display:flex;flex-wrap:wrap;gap:8px;padding:20px}
+  .tool-chips span{
+    font-family:var(--mono);font-size:12px;
+    background:rgba(255,255,255,.7);border:1px solid var(--line-strong);
+    padding:5px 11px;border-radius:6px;color:var(--text-dim);
+    transition:border-color .2s,color .2s,box-shadow .2s;
+  }
+  .tool-chips span:hover{border-color:var(--amber);color:var(--amber-ink);box-shadow:0 3px 10px rgba(242,193,78,.3)}
+  .ai-note{
+    grid-column:1/-1;
+    display:flex;gap:14px;align-items:flex-start;
+    border:1px dashed var(--line-strong);border-radius:12px;
+    background:rgba(255,255,255,.5);
+    padding:18px 22px;font-size:14px;color:var(--text-dim);
+  }
+  .ai-note b{color:var(--amber-ink);white-space:nowrap;font-family:var(--mono);font-size:12px;letter-spacing:.1em;padding-top:3px}
+  .ai-note code{font-family:var(--mono);color:var(--cinnabar)}
+
+  /* ---------- 安全 + 测试 ---------- */
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:start}
+  .check-list{list-style:none;display:flex;flex-direction:column;gap:0}
+  .check-list li{
+    display:flex;gap:16px;padding:16px 0;border-bottom:1px solid var(--line);
+    font-size:15px;align-items:flex-start;
+  }
+  .check-list li:last-child{border-bottom:none}
+  .check-list .mk{
+    font-family:var(--mono);font-size:11px;color:var(--jade);
+    border:1px solid rgba(15,155,132,.45);border-radius:5px;
+    background:rgba(15,155,132,.07);
+    padding:2px 7px;margin-top:3px;flex-shrink:0;
+  }
+  .check-list li b{display:block;font-weight:600;margin-bottom:2px;color:#171A23}
+  .check-list li span{color:var(--text-dim);font-size:14px}
+  .test-box{
+    background:var(--glass);
+    border:1px solid var(--glass-edge);
+    border-radius:16px;
+    padding:32px;
+    backdrop-filter:blur(24px) saturate(1.3);
+    -webkit-backdrop-filter:blur(24px) saturate(1.3);
+    box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.8);
+  }
+  .test-box h3{font-size:17px;margin-bottom:6px;color:#171A23}
+  .test-box .lead{font-size:13px;color:var(--text-dim);margin-bottom:24px}
+  .test-row{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:13px 0;border-bottom:1px dashed var(--line-strong);
+    font-family:var(--mono);font-size:13px;gap:14px;
+  }
+  .test-row:last-child{border-bottom:none}
+  .test-row .name{color:var(--text-dim)}
+  .test-row .n{color:var(--jade);font-weight:700}
+  .test-total{
+    margin-top:20px;padding-top:18px;border-top:1px solid var(--line-strong);
+    display:flex;justify-content:space-between;align-items:baseline;
+  }
+  .test-total b{
+    font-family:var(--mono);font-size:36px;
+    background:var(--grad-text);
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;color:transparent;
+  }
+  .test-total span{font-size:13px;color:var(--text-dim)}
+
+  /* ---------- 下载 ---------- */
+  #download{
+    background:linear-gradient(to bottom,rgba(255,255,255,0),rgba(255,255,255,.42),rgba(255,255,255,0));
+  }
+  .dl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+  .dl{
+    background:var(--glass);
+    border:1px solid var(--glass-edge);
+    border-radius:18px;
+    padding:30px 26px;display:flex;flex-direction:column;gap:14px;
+    backdrop-filter:blur(24px) saturate(1.3);
+    -webkit-backdrop-filter:blur(24px) saturate(1.3);
+    box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.8);
+    transition:transform .25s, box-shadow .25s;
+    position:relative;overflow:hidden;
+  }
+  .dl:hover{transform:translateY(-6px);box-shadow:0 34px 70px rgba(30,36,54,.16)}
+  .dl.reco{border:1.5px solid rgba(232,84,63,.55);box-shadow:0 24px 60px rgba(214,65,43,.14),inset 0 1px 0 rgba(255,255,255,.8)}
+  .dl.reco::before{
+    content:"推荐";position:absolute;top:16px;right:-34px;
+    background:linear-gradient(120deg,#D6412B,#E8743F);color:#fff;font-size:11px;letter-spacing:.2em;
+    padding:4px 40px;transform:rotate(38deg);
+  }
+  .dl .kind{font-family:var(--mono);font-size:11px;letter-spacing:.2em;color:var(--amber-ink)}
+  .dl h3{font-size:20px;font-weight:700;color:#171A23}
+  .dl p{font-size:14px;color:var(--text-dim);flex:1}
+  .dl .file{
+    font-family:var(--mono);font-size:12px;color:var(--text-dim);
+    background:rgba(255,255,255,.7);border:1px solid var(--line-strong);
+    padding:9px 12px;border-radius:8px;word-break:break-all;
+  }
+  .dl a.get{
+    text-align:center;text-decoration:none;font-size:14px;font-weight:600;
+    padding:12px;border-radius:999px;transition:opacity .2s,box-shadow .2s,transform .2s;
+  }
+  .dl a.get.solid{
+    background:linear-gradient(120deg,#D6412B,#E8743F);color:#fff;
+    box-shadow:0 8px 20px rgba(214,65,43,.3);
+  }
+  .dl a.get.line{border:1px solid var(--line-strong);color:var(--text);background:rgba(255,255,255,.55)}
+  .dl a.get:hover{opacity:.9;transform:translateY(-1px)}
+  .dl-note{
+    margin-top:32px;font-size:13px;color:var(--text-dim);
+    display:flex;gap:10px;align-items:flex-start;
+  }
+  .dl-note::before{content:"※";color:var(--amber-ink);flex-shrink:0}
+
+  /* ---------- 快速开始 ---------- */
+  .steps{
+    display:grid;grid-template-columns:repeat(3,1fr);gap:0;
+    background:var(--glass);border:1px solid var(--glass-edge);border-radius:16px;overflow:hidden;
+    backdrop-filter:blur(24px) saturate(1.3);-webkit-backdrop-filter:blur(24px) saturate(1.3);
+    box-shadow:var(--shadow-card),inset 0 1px 0 rgba(255,255,255,.8);
+  }
+  .step{padding:32px 28px;border-right:1px solid var(--line);position:relative}
+  .step:last-child{border-right:none}
+  .step .n{
+    font-family:var(--mono);font-size:13px;color:var(--cinnabar);
+    letter-spacing:.2em;margin-bottom:14px;font-weight:700;
+  }
+  .step h4{font-size:17px;margin-bottom:10px;color:#171A23}
+  .step p{font-size:14px;color:var(--text-dim)}
+  .step code{
+    display:block;margin-top:12px;font-family:var(--mono);font-size:12.5px;
+    background:rgba(255,255,255,.75);border:1px solid var(--line-strong);
+    padding:10px 12px;border-radius:8px;color:#0F7B66;
+    white-space:pre-wrap;word-break:break-all;
+  }
+
+  /* ---------- 页脚 ---------- */
+  footer{
+    border-top:1px solid var(--line-strong);
+    background:rgba(255,255,255,.5);
+    backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+    padding:44px 40px;
+    display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;
+    font-size:13px;color:var(--text-dim);
+  }
+  footer .brand{font-size:14px;color:var(--text)}
+  footer p{max-width:560px}
+
+  /* ---------- 滚动显现 ---------- */
+  .reveal{opacity:0;transform:translateY(24px);transition:opacity .7s ease,transform .7s ease}
+  .reveal.on{opacity:1;transform:none}
+
+  /* ---------- 响应式 ---------- */
+  @media (max-width:960px){
+    header{padding:12px 20px}
+    nav{display:none}
+    section{padding:80px 22px}
+    .hero{padding:110px 22px 70px}
+    .hero-inner{grid-template-columns:1fr;gap:48px}
+    .cap{grid-template-columns:48px 1fr;gap:14px}
+    .cap p{grid-column:2/-1}
+    .ai-grid,.split{grid-template-columns:1fr}
+    .dl-grid,.steps{grid-template-columns:1fr}
+    .step{border-right:none;border-bottom:1px solid var(--line)}
+    .step:last-child{border-bottom:none}
+    .stats{gap:26px}
+    .cal-card{transform:none}
+    .blob{filter:blur(70px)}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .reveal{opacity:1;transform:none;transition:none}
+    *{transition:none!important;animation:none!important}
+  }
+</style>
+</head>
+<body>
+
+<div class="blob blob-1" aria-hidden="true"></div>
+<div class="blob blob-2" aria-hidden="true"></div>
+<div class="blob blob-3" aria-hidden="true"></div>
+
+<header>
+  <div class="brand"><span class="dot"></span>日历备忘录</div>
+  <nav>
+    <a href="#caps">核心能力</a>
+    <a href="#ai">AI / MCP</a>
+    <a href="#security">安全与测试</a>
+    <a href="#download">下载</a>
+  </nav>
+  <a class="nav-cta" href="#download">获取安装包</a>
+</header>
+
+<!-- ================= HERO ================= -->
+<div class="hero">
+  <canvas id="particles" aria-hidden="true"></canvas>
+  <div class="hero-inner">
+    <div>
+      <span class="kicker">Offline · Local-first · AI Ready</span>
+      <h1>日程记在本地，<br><span class="accent">大模型</span>也能替你写。</h1>
+      <p class="hero-sub">
+        像素级复刻的单页日历，后端 <strong>Flask + SQLite</strong>，可<strong>完全离线运行</strong>；
+        额外提供 AI 专用 REST API 与 MCP Server——你的日程，人能点，模型也能读写。
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="#download">下载 Windows 安装包</a>
+        <a class="btn btn-ghost" href="#ai">查看 AI 接口</a>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>15<i>个</i></b><span>MCP 工具</span></div>
+        <div class="stat"><b>18<i>个</i></b><span>AI REST 端点</span></div>
+        <div class="stat"><b>90<i>项</i></b><span>自动化测试</span></div>
+        <div class="stat"><b>0<i>次</i></b><span>联网依赖</span></div>
+      </div>
+    </div>
+
+    <!-- 产品形态示意 -->
+    <div class="cal-card" role="img" aria-label="日历备忘录界面示意：2026年10月月历与当日日程列表">
+      <div class="cal-head">
+        <h3>2026 年 10 月<em>农历九月</em></h3>
+        <span>MEMO.LOCAL:8000</span>
+      </div>
+      <div class="cal-grid">
+        <div class="wd">一</div><div class="wd">二</div><div class="wd">三</div><div class="wd">四</div><div class="wd">五</div><div class="wd">六</div><div class="wd">日</div>
+        <div class="d dim">28<span class="lunar">廿七</span></div>
+        <div class="d">29<span class="lunar">廿八</span></div>
+        <div class="d">30<span class="lunar">廿九</span></div>
+        <div class="d">1<span class="lunar">初一</span></div>
+        <div class="d mark">2<span class="lunar">初二</span></div>
+        <div class="d">3<span class="lunar">初三</span></div>
+        <div class="d">4<span class="lunar">初四</span></div>
+        <div class="d">5<span class="lunar">初五</span></div>
+        <div class="d">6<span class="lunar">初六</span></div>
+        <div class="d mark">7<span class="lunar">寒露</span></div>
+        <div class="d">8<span class="lunar">初八</span></div>
+        <div class="d">9<span class="lunar">初九</span></div>
+        <div class="d">10<span class="lunar">初十</span></div>
+        <div class="d">11<span class="lunar">十一</span></div>
+        <div class="d">12<span class="lunar">十二</span></div>
+        <div class="d">13<span class="lunar">十三</span></div>
+        <div class="d">14<span class="lunar">十四</span></div>
+        <div class="d">15<span class="lunar">十五</span></div>
+        <div class="d">16<span class="lunar">十六</span></div>
+        <div class="d">17<span class="lunar">十七</span></div>
+        <div class="d">18<span class="lunar">十八</span></div>
+        <div class="d">19<span class="lunar">十九</span></div>
+        <div class="d">20<span class="lunar">二十</span></div>
+        <div class="d">21<span class="lunar">廿一</span></div>
+        <div class="d">22<span class="lunar">廿二</span></div>
+        <div class="d">23<span class="lunar">霜降</span></div>
+        <div class="d">24<span class="lunar">廿四</span></div>
+        <div class="d">25<span class="lunar">廿五</span></div>
+        <div class="d">26<span class="lunar">廿六</span></div>
+        <div class="d mark">27<span class="lunar">廿七</span></div>
+        <div class="d">28<span class="lunar">廿八</span></div>
+        <div class="d today">29<span class="lunar">廿九</span></div>
+        <div class="d mark">30<span class="lunar">三十</span></div>
+        <div class="d">31<span class="lunar">十月</span></div>
+        <div class="d dim">1<span class="lunar">初二</span></div>
+      </div>
+      <div class="cal-events">
+        <div class="ev high"><time>15:00</time>需求评审会 · 2 小时<span class="tag">紧急 · 项目A</span></div>
+        <div class="ev"><time>19:30</time>跑步 40 分钟<span class="tag">每天</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 核心能力 ================= -->
+<section id="caps">
+  <div class="wrap">
+    <div class="sec-label">Core Capabilities</div>
+    <h2 class="reveal">一个日历，两种打开方式：<span class="grad">用手点，或让模型调</span>。</h2>
+    <p class="sec-desc reveal">界面与交互对原站 1:1 还原（CSS 969 行零差异），能力上则从「网页备忘录」升级为「本地日程服务」。</p>
+
+    <div class="caps reveal">
+      <div class="cap">
+        <span class="no">01</span>
+        <h3>完全离线运行</h3>
+        <p>数据落在本地 <code>data/memo.db</code>（SQLite WAL），无任何外部服务依赖。拔掉网线，日历照常翻页。</p>
+      </div>
+      <div class="cap">
+        <span class="no">02</span>
+        <h3>免安装三形态交付</h3>
+        <p>安装包 <code>.exe</code>、免安装 <code>zip</code>（双击即用，无需 Python）、<code>Tauri</code> 桌面版，同一内核三种分发。</p>
+      </div>
+      <div class="cap">
+        <span class="no">03</span>
+        <h3>自然语言建日程</h3>
+        <p>「明天下午3点 评审会 2小时 #项目A 紧急」——规则式解析，确定性输出，返回 <code>source.matched</code> 告知识别了哪些片段；时间不明返回 422，绝不臆造。</p>
+      </div>
+      <div class="cap">
+        <span class="no">04</span>
+        <h3>复杂重复规则</h3>
+        <p>每两周、每月第 2 个星期二、每月最后一个星期五，表单下拉可选，API 直传字符串；月末自动收敛（1/31 → 2/28）。</p>
+      </div>
+      <div class="cap">
+        <span class="no">05</span>
+        <h3>双通道鉴权</h3>
+        <p>浏览器走 Cookie 会话，AI / 脚本 / MCP 走 Bearer Token；同一套 <code>current_user()</code> 统一身份，前端零改动。</p>
+      </div>
+      <div class="cap">
+        <span class="no">06</span>
+        <h3>幂等写入</h3>
+        <p>写接口支持 <code>Idempotency-Key</code>，模型重试不会创建重复日程，同 key 返回首次结果并标记 <code>idempotent: true</code>。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= AI / MCP ================= -->
+<section id="ai">
+  <div class="wrap">
+    <div class="sec-label">AI REST API &amp; MCP Server</div>
+    <h2 class="reveal">给大模型留的接口，<span class="grad">不是事后补的</span>。</h2>
+    <p class="sec-desc reveal">18 个 REST 端点 + 15 个 MCP 工具，覆盖日程全生命周期。端点自描述（<code>GET /api/ai/schema</code>），模型先读文档再调用，无需人肉喂接口说明。</p>
+
+    <div class="ai-grid">
+      <div class="panel reveal">
+        <div class="panel-head"><span class="led"></span>REST · 自然语言建日程</div>
+        <pre><span class="c"># 一句话建日程</span>
+curl -X POST http://127.0.0.1:8000/api/ai/event \
+  -H <span class="s">"Authorization: Bearer $T"</span> \
+  -H <span class="s">"Content-Type: application/json"</span> \
+  -d <span class="s">'{"text":"明天下午3点 评审会 2小时 #项目A 紧急"}'</span>
+
+<span class="c"># 返回：识别片段明确可见</span>
+{<span class="k">"startLocal"</span>:<span class="s">"2026-10-30T15:00"</span>,
+ <span class="k">"level"</span>:<span class="r">"high"</span>,
+ <span class="k">"source"</span>:{<span class="k">"matched"</span>:[<span class="s">"明天"</span>,<span class="s">"下午3点"</span>,
+   <span class="s">"2小时"</span>,<span class="s">"紧急"</span>,<span class="s">"#项目A"</span>]}}</pre>
+      </div>
+
+      <div class="panel reveal">
+        <div class="panel-head"><span class="led"></span>MCP · 15 个工具（stdio / HTTP 同端口）</div>
+        <div class="tool-chips">
+          <span>create_event</span><span>create_events_batch</span><span>update_event</span>
+          <span>complete_event</span><span>delete_event</span><span>toggle_subtask</span>
+          <span>brief_status</span><span>list_events</span><span>get_event</span>
+          <span>get_agenda</span><span>parse_text</span><span>list_tags</span>
+          <span>create_tag</span><span>get_calendar_month</span><span>whoami</span>
+        </div>
+        <div class="panel-head" style="border-top:1px solid var(--line);border-bottom:none">
+          <span class="led" style="background:var(--amber);box-shadow:0 0 6px rgba(242,193,78,.7)"></span>服务端 instructions 已内置调用纪律
+        </div>
+        <pre style="padding-top:6px"><span class="c"># 不确定意图 → 先解析预览，不落库</span>
+parse_text(<span class="k">text</span>=<span class="s">"下周三上午开会"</span>)
+<span class="c"># 查现状 → 模型首选 brief_status，统计已算好</span>
+brief_status()</pre>
+      </div>
+
+      <div class="ai-note reveal">
+        <b>422 纪律</b>
+        <span>解析不出确定时间时，接口返回 <code>need_time</code> 错误与可执行的修改建议，而不是猜一个时间写进你的日历。AI 的边界由服务端强制，不靠模型自觉。</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 安全与测试 ================= -->
+<section id="security">
+  <div class="wrap">
+    <div class="sec-label">Security &amp; Verification</div>
+    <h2 class="reveal">能被 AI 调用的接口，<span class="grad">先把闸门焊死</span>。</h2>
+    <p class="sec-desc reveal">相对原站新增的安全加固，全部有实现、有回归测试兜底。</p>
+
+    <div class="split">
+      <ul class="check-list reveal">
+        <li><span class="mk">HASH</span><div><b>Token 只存 SHA-256 哈希</b><span>明文仅签发时返回一次，附带 last_used / use_count 审计，可随时吊销。</span></div></li>
+        <li><span class="mk">LOCK</span><div><b>登录防爆破</b><span>同账号 + IP 连续 5 次失败锁 15 分钟；密码正确即解锁，不把主人锁在门外。</span></div></li>
+        <li><span class="mk">PWD</span><div><b>密码策略</b><span>≥8 位、含字母 + 数字、拦截常见弱口令与字符重复。</span></div></li>
+        <li><span class="mk">WAL</span><div><b>并发安全</b><span>SQLite WAL + busy_timeout，读写不再互斥失败。</span></div></li>
+        <li><span class="mk">XSS</span><div><b>前端转义静态检查</b><span>innerHTML 转义纳入测试套件，含 JS 语法编译验证。</span></div></li>
+      </ul>
+
+      <div class="test-box reveal">
+        <h3>三套免依赖测试 + MCP 端到端</h3>
+        <p class="lead">断言口径是「攻击 / 异常必须失败」，不只看正常路径通过。</p>
+        <div class="test-row"><span class="name">tests_security.py · 鉴权边界 / 越权 / 防爆破</span><span class="n">34</span></div>
+        <div class="test-row"><span class="name">tests_backup.py · 备份恢复 / 失败不破坏数据</span><span class="n">27</span></div>
+        <div class="test-row"><span class="name">tests_mcp.py · MCP stdio 真实协议</span><span class="n">16</span></div>
+        <div class="test-row"><span class="name">tests_mcp_http.py · MCP HTTP 端到端</span><span class="n">7</span></div>
+        <div class="test-row"><span class="name">tests_xss_static.py · 前端转义静态检查</span><span class="n">6</span></div>
+        <div class="test-total"><span>测试项合计</span><b>90</b></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 下载 ================= -->
+<section id="download">
+  <div class="wrap">
+    <div class="sec-label">Download</div>
+    <h2 class="reveal">选一个形态，<span class="grad">双击就能用</span>。</h2>
+    <p class="sec-desc reveal">三种交付物共享同一内核与同一份 <code>data/memo.db</code>，随时可互换。</p>
+
+    <div class="dl-grid">
+      <div class="dl reveal">
+        <span class="kind">INSTALLER</span>
+        <h3>Windows 安装包</h3>
+        <p>标准安装流程，适合长期使用。首次启动自动打开浏览器，设置密码后即用。</p>
+        <div class="file">日历备忘录-1.0.0-安装包.exe</div>
+        <a class="get line" href="日历备忘录-1.0.0-安装包.exe" download>下载安装包</a>
+      </div>
+
+      <div class="dl reco reveal">
+        <span class="kind">PORTABLE · RECOMMENDED</span>
+        <h3>免安装便携版</h3>
+        <p>解压后双击 <b>日历备忘录.exe</b>。不装 Python、不跑脚本，exe 与 _internal 目录放在一起即可。</p>
+        <div class="file">日历备忘录-Windows-x64.zip</div>
+        <a class="get solid" href="日历备忘录-Windows-x64.zip" download>下载便携版</a>
+      </div>
+
+      <div class="dl reveal">
+        <span class="kind">TAURI EDITION</span>
+        <h3>Tauri 桌面版</h3>
+        <p>更轻的桌面壳封装，独立窗口运行，同一套 Web 内核与本地数据目录。</p>
+        <div class="file">日历备忘录-Tauri版-Windows-x64.zip</div>
+        <a class="get line" href="日历备忘录-Tauri版-Windows-x64.zip" download>下载 Tauri 版</a>
+      </div>
+    </div>
+
+    <p class="dl-note">exe 与 <b>_internal</b> 目录必须保持在一起；所有数据保存在 <b>data/</b> 目录，删除 <b>data/memo.db</b> 即重置（会清空日程，请先备份）。默认口令仅用于本地演示，请勿部署到多人可达的环境。</p>
+  </div>
+</section>
+
+<!-- ================= 快速开始 ================= -->
+<section id="start" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-label">Quick Start</div>
+    <h2 class="reveal">三步，从解压到<span class="grad">模型接入</span>。</h2>
+    <p class="sec-desc reveal">普通用户止步于第二步；想让 Claude / Cursor 接管日程的开发者，多一步签发 Token。</p>
+
+    <div class="steps reveal">
+      <div class="step">
+        <div class="n">STEP 01</div>
+        <h4>解压并启动</h4>
+        <p>双击日历备忘录.exe，本地服务自动运行在 8000 端口并打开浏览器。</p>
+        <code>日历备忘录.exe</code>
+      </div>
+      <div class="step">
+        <div class="n">STEP 02</div>
+        <h4>设置管理员密码</h4>
+        <p>首次进入自动进入设置页：至少 8 位、含字母与数字，保存后自动登录。</p>
+        <code>http://127.0.0.1:8000/memo_login.html</code>
+      </div>
+      <div class="step">
+        <div class="n">STEP 03</div>
+        <h4>给模型签发 Token</h4>
+        <p>一行命令签发只存哈希的 Bearer Token，写进 MCP 客户端配置即可读写日程。</p>
+        <code>mcp_server.py --issue-token admin &lt;password&gt;</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="brand"><span class="dot" style="display:inline-block;width:8px;height:8px;background:var(--cinnabar);border-radius:2px;transform:rotate(45deg);margin-right:8px"></span>日历备忘录 · 本地 1:1 复刻版</div>
+  <p>Flask 3.1 · SQLite · waitress · lunar-typescript 1.8.6 (MIT) · 界面与交互对原站零差异，AI / MCP 能力为本地新增。演示项目，不含真实业务数据。</p>
+</footer>
+
+<script>
+(function(){
+  var canvas=document.getElementById('particles');
+  if(!canvas)return;
+  var ctx=canvas.getContext('2d');
+  var reduce=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
+  var pts=[],mouse={x:-9999,y:-9999};
+  // 浅色底：墨色为主，朱红 / 琥珀 / 青绿点缀
+  var COLORS=['rgba(30,34,48,','rgba(214,65,43,','rgba(168,114,10,','rgba(15,155,132,'];
+
+  function resize(){
+    var r=canvas.getBoundingClientRect();
+    W=r.width;H=r.height;
+    canvas.width=W*DPR;canvas.height=H*DPR;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    init();
+  }
+  function init(){
+    var n=Math.round(Math.min(150,Math.max(60,W*H/11000)));
+    pts=[];
+    for(var i=0;i<n;i++){
+      pts.push({
+        x:Math.random()*W,
+        y:Math.random()*H,
+        vx:(Math.random()-.5)*.06,          // 极缓慢漂移
+        vy:(Math.random()-.5)*.06,
+        baseR:Math.random()*1.6+.8,          // 静息半径
+        baseA:Math.random()*.28+.26,         // 静息不透明度
+        ph:Math.random()*Math.PI*2,          // 每颗粒子独立呼吸相位
+        sp:.0009+Math.random()*.0008,        // 呼吸速度（周期约 8~14 秒）
+        c:COLORS[i%9===0?1:(i%13===0?2:(i%17===0?3:0))]
+      });
+    }
+  }
+  function step(ts){
+    var t=ts||0;
+    ctx.clearRect(0,0,W,H);
+    var i,j,p,q,dx,dy,d,breathe,r,a;
+    // 全局呼吸因子：连线随之一同缓慢明暗
+    var g=0.62+0.38*Math.sin(t*0.0011);
+    for(i=0;i<pts.length;i++){
+      p=pts[i];
+      p.x+=p.vx;p.y+=p.vy;
+      if(p.x<0)p.x=W;if(p.x>W)p.x=0;
+      if(p.y<0)p.y=H;if(p.y>H)p.y=0;
+      // 鼠标极轻柔的避让
+      dx=p.x-mouse.x;dy=p.y-mouse.y;
+      d=Math.sqrt(dx*dx+dy*dy);
+      if(d<90&&d>0){p.x+=dx/d*.22;p.y+=dy/d*.22;}
+      breathe=Math.sin(t*p.sp+p.ph);          // -1..1 正弦呼吸
+      r=p.baseR*(1+0.35*breathe);
+      a=p.baseA+0.16*breathe;
+      if(a<0.06)a=0.06;
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,Math.max(0.3,r),0,6.283);
+      ctx.fillStyle=p.c+a.toFixed(3)+')';
+      ctx.fill();
+    }
+    // 柔和连线（浅底低透明度灰蓝，随全局呼吸明暗）
+    for(i=0;i<pts.length;i++){
+      for(j=i+1;j<pts.length;j++){
+        p=pts[i];q=pts[j];
+        dx=p.x-q.x;dy=p.y-q.y;
+        var d2=dx*dx+dy*dy;
+        if(d2<12000){
+          var o=(1-d2/12000)*.16*g;
+          ctx.strokeStyle='rgba(70,80,105,'+o.toFixed(3)+')';
+          ctx.lineWidth=.7;
+          ctx.beginPath();
+          ctx.moveTo(p.x,p.y);
+          ctx.lineTo(q.x,q.y);
+          ctx.stroke();
+        }
+      }
+    }
+    if(!reduce)requestAnimationFrame(step);
+  }
+  window.addEventListener('resize',resize);
+  canvas.parentElement.addEventListener('mousemove',function(e){
+    var r=canvas.getBoundingClientRect();
+    mouse.x=e.clientX-r.left;mouse.y=e.clientY-r.top;
+  });
+  canvas.parentElement.addEventListener('mouseleave',function(){mouse.x=-9999;mouse.y=-9999;});
+  resize();
+  if(reduce){step();}else{requestAnimationFrame(step);}
+
+  // 滚动显现
+  var io=new IntersectionObserver(function(es){
+    es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('on');io.unobserve(e.target);}});
+  },{threshold:.12});
+  document.querySelectorAll('.reveal').forEach(function(el){io.observe(el);});
+})();
+</script>
+</body>
+</html>
