@@ -2705,7 +2705,7 @@ async function loadPoints(page){
     if(!list.length){
       box.dataset.loaded = '1';
       // 纯静态文案拼接，无变量
-      box.innerHTML = '<div class="empty">还没有积分记录<br>注册即送 7 天体验会员 + ' +
+      box.innerHTML = '<div class="empty">还没有积分记录<br>体验赠送 7 天会员 + ' +
                       '体验积分，开通套餐后还会继续到账</div>';
       return;
     }
@@ -3656,7 +3656,7 @@ async function doInviteSearch(tid, kw){
     if(ret.code !== 0){ res.innerHTML = '<div class="tm-empty-inline">' + esc(ret.msg) + '</div>'; return; }
     const list = (ret.data || {}).list || [];
     if(!list.length){
-      res.innerHTML = '<div class="tm-empty-inline">没找到匹配的用户，确认一下邮箱是否注册过</div>';
+      res.innerHTML = '<div class="tm-empty-inline">没找到匹配的用户</div>';
       return;
     }
     res.innerHTML = list.map(u =>
@@ -4769,7 +4769,7 @@ $('#repReplySend').onclick = async () => {
 <div class="pw-modal" id="pwdModal">
   <div class="pw-card">
     <h3>修改密码</h3>
-    <p class="pw-sub">修改后需要妥善保管，遗忘时可用注册邮箱找回。</p>
+    <p class="pw-sub">修改后需要妥善保管。忘记密码时无法自助找回，需重装或删除 data/memo.db 重置。</p>
     <label>原密码</label>
     <input type="password" id="pwOld" placeholder="请输入当前密码" autocomplete="current-password">
     <label>新密码（至少 8 位，含字母和数字）</label>

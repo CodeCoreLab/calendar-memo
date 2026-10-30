@@ -95,51 +95,100 @@ def main():
 
     (ua, pwa, uida), (ub, pwb, uidb) = seed_db()
 
-    # ─────────── 一、P0-1 找回密码验证码 ───────────
-    print("── 一、找回密码（P0-1 修复固化）──")
-    EMAIL_B = "b@sec.local"
+    # ─────────── 一、注册体系移除 + 首次设置密码 ───────────
+    # 产品决策（2026-10-30）：去掉自助注册，首次启动只建 admin、且无默认口令，
+    # 首次打开网页强制设密码。这一节锁死三件事：
+    #   ① 注册/找回密码接口确实不可达（防止哪天被"顺手加回来"）
+    #   ② 未设密码的账号不能靠猜密码登录
+    #   ③ setup 只能作用于待设密码账号，设过之后不可再被劫持
+    print("── 一、注册体系移除与首次设置 ──")
 
-    # 1.1 攻击：全新会话直接猜历史固定码
-    c_att = new_client()
-    _, d = post(c_att, "/api/memo/reset_password",
-                {"email": EMAIL_B, "code": "246810", "password": "Hacked12345"})
-    check("1.1 全新会话猜固定码 246810 被拒", d.get("code") != 0, d.get("msg", ""))
+    # 1.1 注册接口已移除
+    c_any = new_client()
+    r = c_any.post("/api/memo/register",
+                   json={"username": "attacker", "password": "Attacker123",
+                         "email": "atk@sec.local"})
+    check("1.1 注册接口已移除（404）", r.status_code == 404, f"HTTP {r.status_code}")
 
-    # 1.2 攻击：空验证码
-    c_att2 = new_client()
-    _, d = post(c_att2, "/api/memo/reset_password",
-                {"email": EMAIL_B, "code": "", "password": "Hacked12345"})
-    check("1.2 空验证码被拒", d.get("code") != 0, d.get("msg", ""))
+    # 1.2 找回密码两条接口也已移除
+    r = c_any.post("/api/memo/send_code", json={"email": "b@sec.local"})
+    check("1.2 send_code 已移除（404）", r.status_code == 404, f"HTTP {r.status_code}")
+    r = c_any.post("/api/memo/reset_password",
+                   json={"email": "b@sec.local", "code": "246810", "password": "Hacked12345"})
+    check("1.3 reset_password 已移除（404）", r.status_code == 404, f"HTTP {r.status_code}")
 
-    # 1.3 正常流程：拿码 → 同会话改自己密码
-    c_ok = new_client()
-    _, d = post(c_ok, "/api/memo/send_code", {"email": EMAIL_B})
-    code_b = (d.get("data") or {}).get("demoCode")
-    check("1.3 send_code 返回 6 位随机码",
-          bool(code_b) and len(code_b) == 6 and code_b != "246810", str(code_b))
+    # 1.4 全新库：bootstrap 只建一个 admin，且无口令
+    conn = sqlite3.connect(memo.DB_PATH)
+    # 先清掉 seed_db 造的两个账号，模拟真正的首次启动
+    conn.execute("DELETE FROM user_setting")
+    conn.execute("DELETE FROM users")
+    conn.commit()
+    created, uname = memo.bootstrap_admin(conn)
+    conn.close()
+    check("1.4 首次启动创建 admin", created and uname == memo.DEFAULT_ADMIN_USER,
+          f"created={created} name={uname}")
 
-    _, d = post(c_ok, "/api/memo/reset_password",
-                {"email": EMAIL_B, "code": code_b, "password": "NewPassB123"})
-    check("1.4 同会话用本人码可重置", d.get("code") == 0, d.get("msg", ""))
+    conn = sqlite3.connect(memo.DB_PATH)
+    n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    h = conn.execute("SELECT pwd_hash FROM users WHERE username=?", (memo.DEFAULT_ADMIN_USER,)).fetchone()[0]
+    conn.close()
+    check("1.5 只建 1 个账号且无默认口令", n == 1 and h == "", f"用户数={n} pwd_hash={h!r}")
 
-    # 1.5 攻击：A 会话拿到的码，B 会话拿来用
-    c_a = new_client()
-    _, d = post(c_a, "/api/memo/send_code", {"email": "a@sec.local"})
-    code_a = (d.get("data") or {}).get("demoCode")
-    c_b = new_client()
-    _, d = post(c_b, "/api/memo/reset_password",
-                {"email": "a@sec.local", "code": code_a, "password": "Hacked12345"})
-    check("1.5 跨会话重放被拒", d.get("code") != 0, d.get("msg", ""))
+    # 1.6 未设密码时，给任何密码都不能登录（只返回 needSetup）
+    c_setup = new_client()
+    _, d = post(c_setup, "/api/memo/login", {"username": memo.DEFAULT_ADMIN_USER, "password": "Anything12"})
+    check("1.6 未设密码时猜密码登录被拒（返回 needSetup）",
+          d.get("code") != 0 and d.get("needSetup") is True, str(d))
 
-    # 1.6 攻击：用 A 邮箱的码改 B 账号
-    _, d = post(c_a, "/api/memo/reset_password",
-                {"email": EMAIL_B, "code": code_a, "password": "Hacked12345"})
-    check("1.6 拿 A 的码改 B 账号被拒", d.get("code") != 0, d.get("msg", ""))
+    # 1.7 bootstrap 接口应告知需要设置，并给出用户名
+    _, d = get(c_setup, "/api/memo/bootstrap")
+    check("1.7 bootstrap 报告 needSetup 且带用户名",
+          (d.get("data") or {}).get("needSetup") is True
+          and (d.get("data") or {}).get("username") == memo.DEFAULT_ADMIN_USER, str(d.get("data")))
 
-    # 1.7 验证 1.1 的密码确实没被改掉（用新密码登录应失败）
-    c_v = new_client()
-    _, d = post(c_v, "/api/memo/login", {"username": ub, "password": "Hacked12345"})
-    check("1.7 攻击密码无法登录", d.get("code") != 0, d.get("msg", ""))
+    # 1.8 setup 拒绝弱口令与两次不一致
+    _, d = post(c_setup, "/api/memo/setup", {"password": "abc", "password2": "abc"})
+    check("1.8 setup 拒绝弱口令", d.get("code") != 0, d.get("msg", ""))
+    _, d = post(c_setup, "/api/memo/setup",
+                {"password": "SetupPass123", "password2": "OtherPass456"})
+    check("1.9 setup 拒绝两次不一致", d.get("code") != 0, d.get("msg", ""))
+
+    # 1.10 正常设置成功并直接建立会话
+    NEWPWD = "SetupPass123"
+    _, d = post(c_setup, "/api/memo/setup", {"password": NEWPWD, "password2": NEWPWD})
+    check("1.10 setup 设置成功", d.get("code") == 0, d.get("msg", ""))
+    _, d = get(c_setup, "/api/memo/summary")
+    check("1.11 setup 后会话已建立（可直接用）", d.get("code") == 0, d.get("msg", ""))
+
+    # 1.12 设置完成后 bootstrap 不再要求设置
+    _, d = get(new_client(), "/api/memo/bootstrap")
+    check("1.12 设置后 bootstrap 不再要求设置",
+          (d.get("data") or {}).get("needSetup") is False, str(d.get("data")))
+
+    # 1.13 关键：已设过密码后，setup 不能被再次调用劫持
+    c_hijack = new_client()
+    _, d = post(c_hijack, "/api/memo/setup",
+                {"password": "Hijack12345", "password2": "Hijack12345"})
+    check("1.13 已设密码后 setup 不可再被调用", d.get("code") != 0, d.get("msg", ""))
+
+    # 1.14 用新密码能登录，用劫持密码不能
+    c_new = new_client()
+    _, d = post(c_new, "/api/memo/login", {"username": memo.DEFAULT_ADMIN_USER, "password": NEWPWD})
+    check("1.14 设置后的密码可登录", d.get("code") == 0, d.get("msg", ""))
+    c_h = new_client()
+    _, d = post(c_h, "/api/memo/login", {"username": memo.DEFAULT_ADMIN_USER, "password": "Hijack12345"})
+    check("1.15 劫持密码无效", d.get("code") != 0, d.get("msg", ""))
+
+    # 1.16 恢复 seed_db 的两个账号，后续小节依赖它们。
+    # 注意：1.4 已把 users 清空，这里必须重新灌一遍，否则第四节没有可用账号。
+    conn = sqlite3.connect(memo.DB_PATH)
+    conn.execute("DELETE FROM user_setting")
+    conn.execute("DELETE FROM users")
+    conn.commit()
+    conn.close()
+    (ua, pwa, uida), (ub, pwb, uidb) = seed_db()
+    _, d = post(new_client(), "/api/memo/login", {"username": ua, "password": pwa})
+    check("1.16 重置后可正常登录（后续小节前置条件）", d.get("code") == 0, d.get("msg", ""))
 
     # ─────────── 二、P0-2 /api/visit 限长限频 ───────────
     print("\n── 二、访问上报（P0-2 修复固化）──")
@@ -187,9 +236,10 @@ def main():
     # ─────────── 四、越权：A 不能碰 B 的数据 ───────────
     print("\n── 四、横向越权防护 ───")
     ca, da = login(ua, pwa)
-    cb_, db_ = login(ub, pwb)   # b 的密码在 1.4 被改成 NewPassB123
-    cb_, db_ = login(ub, "NewPassB123")
-    check("4.0 A/B 各自登录成功", da.get("code") == 0 and db_.get("code") == 0)
+    cb_, db_ = login(ub, pwb)   # pwb 来自 seed_db，未被本套用例改动过
+    check("4.0 A/B 各自登录成功",
+          da.get("code") == 0 and db_.get("code") == 0,
+          f"A={da.get('msg')} B={db_.get('msg')}")
 
     # A 建一条日程，B 尝试读写删
     _, d = post(ca, "/api/memo/event", {

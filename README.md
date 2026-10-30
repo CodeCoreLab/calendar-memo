@@ -28,14 +28,15 @@ python -m venv .venv
 
 打开 <http://127.0.0.1:8000/memo_login.html>。
 
-种子账号（仅本地演示，可用环境变量覆盖）：
+**首次启动会自动创建管理员账号 `admin`，但不预置任何口令**：
 
-| 账号 | 密码 | 覆盖变量 | 用途 |
-|------|------|---------|------|
-| `demo` | `demo12345` | `SEED_ADMIN_USER` / `SEED_ADMIN_PASS` | 主账号，预置日程/标签/团队/积分 |
-| `teammate01` | `teammate12345` | `SEED_TEAMMATE_PASS` | 协作演示，已在「运维小组」，用于验证邀请与日报往来 |
+1. 打开 <http://127.0.0.1:8000/memo_login.html>
+2. 页面自动进入「设置管理员密码」——设一个至少 8 位、含字母和数字的密码
+3. 保存后自动登录进主页，之后都用这个密码
 
-首次部署务必改口令：`SEED_ADMIN_PASS=... python seed.py`
+> 没有自助注册，也没有自助找回密码。忘记密码只能删除 `data/memo.db` 重置
+> （会连带清空所有日程数据，请先备份）。
+> 账号名可用 `MEMO_ADMIN_USER` 覆盖（须在首次启动前设置）。
 
 三种启动方式：
 
@@ -62,7 +63,7 @@ python -m venv .venv
 ```bash
 curl -X POST http://127.0.0.1:8000/api/ai/token \
   -H "Content-Type: application/json" \
-  -d '{"username":"${SEED_ADMIN_USER:-demo}","password":"${SEED_ADMIN_PASS:-demo12345}","name":"my-agent"}'
+  -d '{"username":"admin","password":"<你首次启动时设置的密码>","name":"my-agent"}'
 ```
 
 返回的 `data.token` 只出现一次（服务端只存 SHA-256 哈希）。之后所有请求携带：
@@ -172,7 +173,7 @@ curl -X POST .../api/ai/event -H "Idempotency-Key: task-42" -d '{"title":"...","
 
 ```bash
 # 签发一个给 MCP 用的 Token
-.venv/Scripts/python.exe mcp_server.py --issue-token ${SEED_ADMIN_USER:-demo} ${SEED_ADMIN_PASS:-demo12345}
+.venv/Scripts/python.exe mcp_server.py --issue-token admin "<你首次启动时设置的密码>"
 ```
 
 ### 2. stdio 模式（Claude Desktop / Cursor）
@@ -276,8 +277,7 @@ tests_mcp_http.py   MCP HTTP 端到端测试
 requirements.lock   运行时依赖精确锁定（复现环境用）
 requirements-dev.lock 打包/托盘/运维脚本依赖
 web/memo.html       主页面（与原站 CSS 零差异）
-web/memo_login.html 登录/注册页
-web/memo_reset.html 找回密码页
+web/memo_login.html 登录 / 首次设置密码页
 web/static/lunar.js 农历库
 data/memo.db        运行时数据库（自动生成）
 docs/ACCEPTANCE.md  1:1 还原验收报告

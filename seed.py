@@ -1,11 +1,13 @@
-"""初始化本地数据库：建表 + 写入演示账号与示例数据。
+"""初始化本地数据库：建表 + 写入示例数据。
 
 用法：
     .venv/Scripts/python.exe seed.py          # 仅当库为空时写入
     .venv/Scripts/python.exe seed.py --force  # 清空后重建
 
-演示账号：可用环境变量 SEED_ADMIN_USER / SEED_ADMIN_PASS 覆盖，
-默认 demo / demo12345（仅演示用途，请勿用于任何真实环境）
+账号：注册体系已移除，账号由 app.init_db() → bootstrap_admin() 自动创建，
+默认用户名 admin（可用 MEMO_ADMIN_USER 覆盖），**不设默认口令** ——
+首次打开网页会强制进入「设置管理员密码」。
+本脚本只负责灌示例数据（日程/标签/团队），不再创建账号。
 """
 
 import os
@@ -13,7 +15,6 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 
-from werkzeug.security import generate_password_hash
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "memo.db")
 DT = "%Y-%m-%d %H:%M"
@@ -44,33 +45,22 @@ def main(force=False):
         conn.commit()
 
     now = datetime.now()
-    # 主账号：口令通过环境变量注入，默认值为演示口令（见文件头说明）
-    admin_user = os.environ.get("SEED_ADMIN_USER", "demo")
-    admin_pass = os.environ.get("SEED_ADMIN_PASS", "demo12345")
-    cur = conn.execute(
-        "INSERT INTO users(username, nickname, email, pwd_hash, member_expire, points, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (admin_user, "x小马", os.environ.get("SEED_ADMIN_EMAIL", "demo@local.dev"),
-         generate_password_hash(admin_pass),
-         fmt(now + timedelta(days=27)), 0, fmt(now)),
-    )
-    uid = cur.lastrowid
-    conn.execute("INSERT INTO user_setting(user_id, show_huangli) VALUES (?,0)", (uid,))
-    conn.execute("UPDATE users SET points = 300 WHERE id = ?", (uid,))
-    conn.execute("INSERT INTO points_log(user_id, delta, kind, kind_text, remark, balance, time) "
-                 "VALUES (?,?,?,?,?,?,?)",
-                 (uid, 300, "plan", "开通套餐", "本地演示：月卡会员 30 天 + 300 积分", 300, fmt(now)))
-
-    # 子账号：用于演示团队协作 / 日报往来
-    cur = conn.execute(
-        "INSERT INTO users(username, nickname, email, pwd_hash, member_expire, points, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        ("teammate01", "小李", "li@local.dev",
-         generate_password_hash(os.environ.get("SEED_TEAMMATE_PASS", "teammate12345")),
-         fmt(now + timedelta(days=27)), 120, fmt(now)),
-    )
-    uid_b = cur.lastrowid
-    conn.execute("INSERT INTO user_setting(user_id) VALUES (?)", (uid_b,))
+    # 账号由 bootstrap_admin 统一创建（默认 admin、无口令、待首次设置）。
+    # seed 不再造第二个账号：注册体系已移除，多账号只应通过实际的团队邀请流程产生。
+    conn.commit()
+    created, admin_user = memo_app.bootstrap_admin(conn)
+    if not created:
+        admin_user = conn.execute(
+            "SELECT username FROM users ORDER BY id LIMIT 1").fetchone()[0]
+    uid = conn.execute("SELECT id FROM users WHERE username = ?", (admin_user,)).fetchone()[0]
+    if created:
+        conn.execute("UPDATE user_setting SET show_huangli = 0 WHERE user_id = ?", (uid,))
+        conn.execute("UPDATE users SET member_expire = ?, points = 300 WHERE id = ?",
+                     (fmt(now + timedelta(days=27)), uid))
+        conn.execute("INSERT INTO points_log(user_id, delta, kind, kind_text, remark, balance, time) "
+                     "VALUES (?,?,?,?,?,?,?)",
+                     (uid, 300, "plan", "开通套餐",
+                      "示例数据：月卡会员 30 天 + 300 积分", 300, fmt(now)))
 
     tags = {}
     for i, (name, color) in enumerate([("项目A", "#7F77DD"), ("运维", "#4f46e5"),
@@ -115,13 +105,6 @@ def main(force=False):
                        ("运维小组", uid, "稳定性保障中心值班组", fmt(now))).lastrowid
     conn.execute("INSERT INTO memberships(team_id, user_id, role, status, join_time) VALUES (?,?,?,?,?)",
                  (tid, uid, "owner", "joined", fmt(now)))
-    conn.execute("INSERT INTO memberships(team_id, user_id, role, status, join_time, remark) VALUES (?,?,?,?,?,?)",
-                 (tid, uid_b, "member", "joined", fmt(now), "前端-小李"))
-    conn.execute("INSERT INTO invites(team_id, inviter_id, invitee_id, status, message, invite_time, join_time)"
-                 " VALUES (?,?,?,?,?,?,?)",
-                 (tid, uid, uid_b, "joined", "一起来协作", fmt(now - timedelta(days=2)), fmt(now - timedelta(days=2))))
-
-    add_event(uid_b, "整理周报模板", "按组长要求调整格式", 0, 1, "", "middle", "doing", [], ["收集素材"])
 
     now_s = fmt(now)
     conn.executemany("INSERT INTO notices(title, content, kind, top, publish_time) VALUES (?,?,?,?,?)", [
@@ -134,8 +117,8 @@ def main(force=False):
     ])
     conn.commit()
     conn.close()
-    print(f"初始化完成：账号 {admin_user}（主），teammate01（协作演示）")
-    print("口令取自环境变量 SEED_ADMIN_PASS / SEED_TEAMMATE_PASS（未设置则用演示默认值）")
+    print(f"初始化完成：示例数据已写入，账号 {admin_user}")
+    print("该账号尚未设置密码 —— 首次打开网页会强制进入「设置管理员密码」")
     print(f"数据库：{DB_PATH}")
 
 

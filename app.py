@@ -133,10 +133,13 @@ PWD_BLACKLIST = {
     "a1234567", "passw0rd", "letmein1", "welcome1",
 }
 
+# 首次启动自动创建的管理员。pwd_hash 为空串 = 尚未设置密码，
+# 此时任何登录尝试都被引导到「首次设置」，不走密码校验。
+DEFAULT_ADMIN_USER = os.environ.get("MEMO_ADMIN_USER", "admin")
+
 LOGIN_MAX_FAIL = 5
 LOGIN_LOCK_SEC = 15 * 60
 LOGIN_LOCK_EXTRA = 3       # 锁定期内仍允许的次数（给本人留后门，但不给攻击者无限窗口）
-RESET_CODE_TTL_SEC = 10 * 60       # 找回密码验证码有效期
 LOGIN_FAIL = {}
 LOGIN_LOCK = threading.Lock()      # waitress 多线程下保护 LOGIN_FAIL
 
@@ -473,10 +476,34 @@ def close_db(_exc):
         conn.close()
 
 
+def bootstrap_admin(conn):
+    """用户表为空时创建默认管理员（未设密码）。
+
+    这是唯一的账号入口 —— 注册体系已移除。pwd_hash 留空串表示「待设置」，
+    不预置任何默认口令：默认口令一旦写进代码就会跟着分发出去，
+    是比验证码硬编码更严重的弱口令问题。
+    返回 (created, username)。
+    """
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
+        return False, None
+    conn.execute(
+        "INSERT INTO users(username, nickname, email, pwd_hash, is_admin, member_expire, points, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (DEFAULT_ADMIN_USER, "管理员", "", "", 1,
+         fmt_dt(datetime.now() + timedelta(days=3650)), 0, now_str()),
+    )
+    uid = conn.execute("SELECT id FROM users WHERE username = ?",
+                       (DEFAULT_ADMIN_USER,)).fetchone()[0]
+    conn.execute("INSERT INTO user_setting(user_id) VALUES (?)", (uid,))
+    conn.commit()
+    return True, DEFAULT_ADMIN_USER
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     conn.commit()
+    bootstrap_admin(conn)
     cur = conn.execute("SELECT COUNT(*) c FROM notices")
     if cur.fetchone()[0] == 0:
         now = datetime.now().strftime(DT_FMT)
@@ -932,11 +959,6 @@ def page_login():
     return send_from_directory(WEB_DIR, "memo_login.html")
 
 
-@app.route("/memo_reset.html")
-def page_reset():
-    return send_from_directory(WEB_DIR, "memo_reset.html")
-
-
 @app.route("/liushan.jpg")
 @app.route("/pay.jpg")
 @app.route("/gongan.png")
@@ -956,8 +978,16 @@ def api_login():
     d = request.get_json(silent=True) or {}
     username = (d.get("username") or "").strip()
     password = d.get("password") or ""
-    if not username or not password:
-        return err("请输入用户名和密码")
+    if not username:
+        return err("请输入用户名")
+    row = db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    # 账号存在但 pwd_hash 为空 → 还没设过密码（首次启动的默认管理员）。
+    # 不校验密码（空 hash 校验必然失败），直接告诉前端去设置页。
+    if row and not (row["pwd_hash"] or "").strip():
+        return jsonify({"code": 2, "needSetup": True,
+                        "msg": "该账号尚未设置密码，请先设置"})
+    if not password:
+        return err("请输入密码")
     left, hard = login_locked(username)
     if left:
         wait = left // 60 + 1
@@ -976,7 +1006,7 @@ def api_login():
         # 软锁期的失败也要计数，配额才会推进到硬锁
         login_fail(username)
         return err(f"密码错误次数过多，请 {wait} 分钟后再试")
-    u = db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    u = row
     if not u or not check_password_hash(u["pwd_hash"], password):
         login_fail(username)
         log_warn("auth.login_failed", username=username, ip=request.remote_addr or "")
@@ -988,39 +1018,50 @@ def api_login():
     return ok({"nickname": u["nickname"] or u["username"], "username": u["username"]}, "登录成功")
 
 
-@app.post("/api/memo/register")
-def api_register():
+@app.get("/api/memo/bootstrap")
+def api_bootstrap():
+    """首次启动探测：给前端判断要不要显示「设置管理员密码」页。
+
+    不泄露用户数量——只回答「有没有待设密码的账号」，以及它的用户名。
+    """
+    conn = db()
+    row = conn.execute(
+        "SELECT username FROM users WHERE pwd_hash = '' ORDER BY id LIMIT 1").fetchone()
+    return ok({"needSetup": bool(row),
+               "username": row["username"] if row else ""})
+
+
+@app.post("/api/memo/setup")
+def api_setup():
+    """为待设密码的账号设置初始密码（仅限 pwd_hash 为空串的账号）。
+
+    这条接口不校验旧密码，所以必须严格限定作用对象：
+    - 只处理 pwd_hash 为空的账号（已设过密码的账号走 /api/memo/change_password）
+    - 若存在多个待设账号，按 id 升序只处理第一个（正常只有一个）
+    - 设置成功后立刻建立会话，省掉用户再登录一次
+    """
     d = request.get_json(silent=True) or {}
-    username = (d.get("username") or "").strip()
-    nickname = (d.get("nickname") or "").strip()
-    email = (d.get("email") or "").strip()
     password = d.get("password") or ""
-    if len(username) < 3:
-        return err("用户名至少 3 位")
-    if not re.fullmatch(r"[A-Za-z0-9_]+", username):
-        return err("用户名只能包含字母、数字和下划线")
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        return err("请填写正确的邮箱")
+    password2 = d.get("password2")
+    if password2 is not None and password != password2:
+        return err("两次输入的密码不一致")
     bad = pwd_problem(password)
     if bad:
         return err(bad)
     conn = db()
-    if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
-        return err("用户名已被占用")
-    if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
-        return err("该邮箱已注册")
-    expire = fmt_dt(datetime.now() + timedelta(days=7))
-    cur = conn.execute(
-        "INSERT INTO users(username, nickname, email, pwd_hash, member_expire, points, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (username, nickname or username, email, generate_password_hash(password), expire, 0, now_str()),
-    )
-    uid = cur.lastrowid
-    conn.execute("INSERT INTO user_setting(user_id) VALUES (?)", (uid,))
-    add_points(conn, uid, 50, "trial", "体验赠送", "注册赠送 7 天体验会员 + 50 积分")
+    row = conn.execute(
+        "SELECT * FROM users WHERE pwd_hash = '' ORDER BY id LIMIT 1").fetchone()
+    if not row:
+        return err("没有待设置密码的账号")
+    conn.execute("UPDATE users SET pwd_hash = ? WHERE id = ?",
+                 (generate_password_hash(password), row["id"]))
     conn.commit()
-    session["uid"] = uid
-    return ok({"nickname": nickname or username, "username": username}, "注册成功")
+    session["uid"] = row["id"]
+    log_warn("auth.admin_setup", uid=row["id"], username=row["username"],
+             ip=request.remote_addr or "")
+    return ok({"username": row["username"],
+               "nickname": row["nickname"] or row["username"]},
+              "管理员密码已设置，请牢记")
 
 
 @app.get("/api/memo/check")
@@ -1058,59 +1099,7 @@ def api_change_password():
     return ok(None, "密码已修改")
 
 
-@app.post("/api/memo/send_code")
-def api_send_code():
-    """生成找回密码验证码。
 
-    本地单机版不接邮件服务，因此在 DEMO 模式（MEMO_DEMO_RESET=1，默认开）下
-    把验证码直接回给调用方，便于离线演示。验证码本身是随机会话值，且与本次
-    会话、目标邮箱、10 分钟有效期三重绑定——不能拿来重置别的账号。
-    部署到任何真实场景（多人可达）前必须置 MEMO_DEMO_RESET=0 并接真实邮件通道。
-    """
-    d = request.get_json(silent=True) or {}
-    email = (d.get("email") or "").strip()
-    if not email:
-        return err("请填写邮箱")
-    u = db().execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
-    if not u:
-        return err("该邮箱未注册")
-    code = f"{secrets.randbelow(1000000):06d}"
-    session["reset_email"] = email
-    session["reset_code"] = code
-    session["reset_at"] = time.time()
-    if os.getenv("MEMO_DEMO_RESET", "1") == "1":
-        return ok({"demoCode": code},
-                  "验证码已生成（DEMO 模式直接返回，生产环境请关闭 MEMO_DEMO_RESET）")
-    return ok(None, "验证码已发送，请查收邮件")
-
-
-@app.post("/api/memo/reset_password")
-def api_reset_password():
-    d = request.get_json(silent=True) or {}
-    email = (d.get("email") or "").strip()
-    code = (d.get("code") or "").strip()
-    pwd = d.get("password") or ""
-    # 三重绑定：验证码必须存在、属于本会话、属于同一邮箱、且未超时。
-    # 缺任何一条都能被用来重置他人账号。
-    sent_code = session.get("reset_code")
-    sent_email = session.get("reset_email")
-    sent_at = session.get("reset_at") or 0
-    if (not sent_code or not sent_email or email != sent_email
-            or time.time() - sent_at > RESET_CODE_TTL_SEC
-            or not secrets.compare_digest(code, sent_code)):
-        return err("验证码不正确或已过期")
-    bad = pwd_problem(pwd)
-    if bad:
-        return err(bad)
-    conn = db()
-    u = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
-    if not u:
-        return err("该邮箱未注册")
-    conn.execute("UPDATE users SET pwd_hash = ? WHERE id = ?", (generate_password_hash(pwd), u["id"]))
-    conn.commit()
-    log_warn("auth.password_reset", uid=u["id"], email=email,
-             ip=request.remote_addr or "")
-    return ok(None, "密码已重置，请用新密码登录")
 
 
 @app.post("/api/visit")
