@@ -65,6 +65,8 @@ def bind_identity(token=None, username=None, password=None, conn=None):
                 (memo.hash_token(token),)).fetchone()
             if not row:
                 return False, "Token 无效或已被吊销"
+            if memo.token_expired(row):
+                return False, "Token 已过期，请重新签发"
             user = conn.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
             if not user:
                 return False, "Token 关联的用户不存在"
@@ -136,10 +138,12 @@ def _uid(need_write=False):
         conn = _conn()
         try:
             row = conn.execute(
-                "SELECT user_id, scope FROM api_tokens WHERE token_hash=? AND revoked=0",
+                "SELECT * FROM api_tokens WHERE token_hash=? AND revoked=0",
                 (memo.hash_token(tok),)).fetchone()
             if not row:
                 raise RuntimeError("请求头中的 Token 无效或已吊销")
+            if memo.token_expired(row):
+                raise RuntimeError("请求头中的 Token 已过期，请重新签发")
             if need_write:
                 parts = {x.strip() for x in (row["scope"] or "").split(",")}
                 if "write" not in parts:
@@ -709,13 +713,20 @@ def main():
             sys.exit(1)
         conn = _conn()
         raw = "memo_" + memo.secrets.token_urlsafe(32)
+        # scope 与有效期由服务端按账号能力决定（与 POST /api/ai/token 同一口径），
+        # 避免 CLI 路径绕过只读限制。
+        urow = conn.execute("SELECT * FROM users WHERE id=?", (_uid(),)).fetchone()
+        scope = memo.token_scope_cap(urow) if urow is not None else "read"
+        expires_at = memo.fmt_dt(memo.datetime.now() + memo.timedelta(days=memo.TOKEN_TTL_DAYS))
         cur = conn.execute(
-            "INSERT INTO api_tokens(user_id, name, token_hash, prefix, scope, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (_uid(), "mcp-cli", memo.hash_token(raw), raw[:12], "read,write", memo.now_str()))
+            "INSERT INTO api_tokens(user_id, name, token_hash, prefix, scope, created_at, expires_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (_uid(), "mcp-cli", memo.hash_token(raw), raw[:12], scope,
+             memo.now_str(), expires_at))
         conn.commit()
         conn.close()
-        print(f"已为「{_STATIC['name']}」签发 Token（id={cur.lastrowid}）：\n{raw}")
+        print(f"已为「{_STATIC['name']}」签发 Token（id={cur.lastrowid}，scope={scope}，"
+              f"{expires_at} 到期）：\n{raw}")
         return
 
     ok, msg = bind_identity(token=args.token, username=args.user, password=args.password)

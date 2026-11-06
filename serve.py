@@ -14,6 +14,7 @@
 """
 
 import argparse
+import http
 import json
 import os
 import socket
@@ -28,6 +29,23 @@ import app as memo
 WEB_PORT = 8000
 MCP_INTERNAL_PORT = 0          # 0 = 自动选空闲端口
 MCP_PATH_PREFIX = "/mcp"
+
+
+def status_line(code):
+    """构造合法的 HTTP 状态行：`<code> <reason-phrase>`（RFC 9110 §4）。
+
+    WSGI 的 start_response 要求状态行是「状态码 + 空格 + reason-phrase」。
+    直接拼 f"{code} OK" 会得到 "404 OK" 这种码/短语不匹配的非法状态行，
+    严格 HTTP 解析器与部分代理会报错。
+
+    上游返回非标准状态码时回退到 "Unknown"，仍保持状态行格式合法。
+    """
+    try:
+        phrase = http.HTTPStatus(code).phrase
+    except ValueError:
+        phrase = "Unknown"
+    return f"{code} {phrase}"
+
 
 # 上游超时按场景区分（SSE/流式长连接不能提前断，普通调用不该等太久）。
 # 注意：urllib.request 的 timeout 只接受单个数字，传 (connect, read) 元组
@@ -79,10 +97,13 @@ class MCPForwarder:
         try:
             conn = memo.sqlite3.connect(memo.DB_PATH)
             try:
+                conn.row_factory = memo.sqlite3.Row
                 conn.execute("PRAGMA busy_timeout = 3000")
-                ok = conn.execute(
-                    "SELECT 1 FROM api_tokens WHERE token_hash=? AND revoked=0",
-                    (h,)).fetchone() is not None
+                row = conn.execute(
+                    "SELECT * FROM api_tokens WHERE token_hash=? AND revoked=0",
+                    (h,)).fetchone()
+                # 过期 Token 同样视为无效（否则过期后仍能过 MCP 网关）
+                ok = row is not None and not memo.token_expired(row)
             finally:
                 conn.close()
         except memo.sqlite3.Error:
@@ -120,7 +141,7 @@ class MCPForwarder:
                 "message": "MCP 需要有效的 Bearer Token：先运行 "
                            "python mcp_server.py --issue-token <用户> <密码>"}},
                 ensure_ascii=False).encode()
-            start_response("401 Unauthorized",
+            start_response(status_line(401),
                            [("Content-Type", "application/json; charset=utf-8"),
                             ("Content-Length", str(len(msg))),
                             ("WWW-Authenticate", 'Bearer realm="calendar-memo"')])
@@ -165,13 +186,13 @@ class MCPForwarder:
                                                 "content-length")]
         except Exception as exc:  # 上游没起来
             msg = f"MCP upstream unavailable: {exc}".encode()
-            start_response("502 Bad Gateway",
+            start_response(status_line(502),
                            [("Content-Type", "text/plain; charset=utf-8"),
                             ("Content-Length", str(len(msg)))])
             return [msg]
 
         out_headers.append(("Content-Length", str(len(raw))))
-        start_response(f"{status} OK", out_headers)
+        start_response(status_line(status), out_headers)
         return [raw]
 
 

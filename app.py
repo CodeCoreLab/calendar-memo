@@ -126,6 +126,14 @@ PWD_MAX_LEN = 72
 PROOF_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 UPLOAD_TTL_DAYS = 30
 
+# API Token 默认有效期（天）。Token 一旦泄漏就长期有效是真实风险，
+# 所以签发时必须带过期时间，到期后校验侧直接拒绝。
+TOKEN_TTL_DAYS = 90
+# Token 使用次数的批量落库阈值：达到次数或积压过久才写库，
+# 避免每个 API 请求都 UPDATE + commit（写库热路径）。
+TOKEN_USE_FLUSH_COUNT = 20
+TOKEN_USE_FLUSH_SECONDS = 300
+
 # 常见弱口令（小写比对）；内网单人场景不追求大字典，只拦最典型的几个
 PWD_BLACKLIST = {
     "password", "password1", "12345678", "123456789", "1234567890",
@@ -370,7 +378,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   created_at TEXT NOT NULL,
   last_used TEXT DEFAULT '',
   use_count INTEGER DEFAULT 0,
-  revoked INTEGER DEFAULT 0
+  revoked INTEGER DEFAULT 0,
+  expires_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens(user_id);
 
@@ -499,10 +508,28 @@ def bootstrap_admin(conn):
     return True, DEFAULT_ADMIN_USER
 
 
+def _migrate_schema(conn):
+    """给已有数据库补上 SCHEMA 里新增的列。
+
+    SCHEMA 用的是 CREATE TABLE IF NOT EXISTS —— 对已存在的表不会补列，
+    所以新增字段（如 api_tokens.expires_at）必须在这里显式 ALTER 一次。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(api_tokens)").fetchall()}
+    if "expires_at" not in cols:
+        conn.execute("ALTER TABLE api_tokens ADD COLUMN expires_at TEXT DEFAULT ''")
+        # 升级前签发的 Token 没有过期时间，一律给一个 90 天宽限期，
+        # 而不是留成「永不过期」——那正是本次要修掉的漏洞形态。
+        grace = fmt_dt(datetime.now() + timedelta(days=TOKEN_TTL_DAYS))
+        conn.execute("UPDATE api_tokens SET expires_at = ? WHERE expires_at = '' OR expires_at IS NULL",
+                     (grace,))
+        conn.commit()
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate_schema(conn)
     bootstrap_admin(conn)
     cur = conn.execute("SELECT COUNT(*) c FROM notices")
     if cur.fetchone()[0] == 0:
@@ -519,6 +546,24 @@ def init_db():
 
 
 # ────────────────────────────── 通用工具 ──────────────────────────────
+
+def qint(name, default, lo=None, hi=None):
+    """读取整数型 query 参数。
+
+    非法值（'abc'、'1e5'、空串等）一律回退到 default，绝不让 ValueError
+    冒泡到全局异常处理变成 500 —— 参数写错是客户端问题，不该报服务端故障。
+    """
+    raw = request.args.get(name)
+    try:
+        val = int(str(raw).strip()) if raw is not None and str(raw).strip() != "" else default
+    except (TypeError, ValueError):
+        val = default
+    if lo is not None:
+        val = max(lo, val)
+    if hi is not None:
+        val = min(hi, val)
+    return val
+
 
 def now_str():
     return datetime.now().strftime(DT_FMT)
@@ -599,6 +644,95 @@ def hash_token(raw):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def token_expired(row):
+    """Token 是否已过期。
+
+    expires_at 为空视为「未设过期」（历史数据兜底）；有值时按服务端时间判定。
+    所有校验入口（Web / MCP / serve.py）都必须过这一关，否则过期 Token 仍可用。
+    """
+    try:
+        exp = (row["expires_at"] or "").strip()
+    except (IndexError, KeyError):
+        return False
+    if not exp:
+        return False
+    dt = parse_dt(exp)
+    return bool(dt and dt < datetime.now())
+
+
+# ─────────── Token 使用计数（批量落库） ───────────
+# 以前每个 API 调用都 UPDATE api_tokens + commit，请求热路径上直接写库，
+# 并发时容易撞 SQLite 写锁。这里改成内存累计 pending 计数：
+# 累计到 TOKEN_USE_FLUSH_COUNT 次、或某条记录积压超过 TOKEN_USE_FLUSH_SECONDS 秒
+# 才批量落库一次。
+_TOKEN_USE_PENDING = {}      # token_id -> [delta, last_used, first_seen_ts]
+_TOKEN_USE_LOCK = threading.Lock()
+
+
+def _record_token_use(token_id):
+    """累计一次 Token 使用；达到阈值或积压过久才落库。"""
+    now = now_str()
+    ts = time.time()
+    with _TOKEN_USE_LOCK:
+        ent = _TOKEN_USE_PENDING.get(token_id)
+        if ent is None:
+            _TOKEN_USE_PENDING[token_id] = [1, now, ts]
+        else:
+            ent[0] += 1
+            ent[1] = now
+        total = sum(v[0] for v in _TOKEN_USE_PENDING.values())
+        stale = any((ts - v[2]) >= TOKEN_USE_FLUSH_SECONDS
+                    for v in _TOKEN_USE_PENDING.values())
+    if total >= TOKEN_USE_FLUSH_COUNT or stale:
+        _flush_token_use()
+
+
+def _flush_token_use():
+    """把内存里累计的 Token 使用计数一次性写回 api_tokens 表。
+
+    独立开连接写入，不依赖请求上下文（进程退出时也能调用）。
+    """
+    with _TOKEN_USE_LOCK:
+        pending = list(_TOKEN_USE_PENDING.items())
+        _TOKEN_USE_PENDING.clear()
+    if not pending:
+        return 0
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        for tid, (delta, last_used, _ts) in pending:
+            conn.execute(
+                "UPDATE api_tokens SET last_used = ?, use_count = use_count + ? WHERE id = ?",
+                (last_used, delta, tid))
+        conn.commit()
+    except sqlite3.Error:
+        # 落库失败不影响请求本身：计数只是统计用途，丢失可接受
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+    finally:
+        conn.close()
+    return len(pending)
+
+
+def token_scope_cap(user_row):
+    """服务端按账号能力推导该账号可获得的最高 Token scope。
+
+    scope 不再由调用方自选：管理员与会员可读写，普通账号最高只读。
+    """
+    try:
+        if user_row["is_admin"]:
+            return "read,write"
+    except (IndexError, KeyError, TypeError):
+        pass
+    try:
+        is_member, _, _ = member_info(user_row)
+    except (IndexError, KeyError, TypeError):
+        is_member = False
+    return "read,write" if is_member else "read"
+
+
 def token_from_request():
     """从 Authorization: Bearer <token> 或 X-API-Token 取 Token 并解析出用户。
 
@@ -619,12 +753,13 @@ def token_from_request():
     ).fetchone()
     if not row:
         return None, None
+    if token_expired(row):
+        return None, None
     user = conn.execute("SELECT * FROM users WHERE id = ?", (row["user_id"],)).fetchone()
     if not user:
         return None, None
-    conn.execute("UPDATE api_tokens SET last_used = ?, use_count = use_count + 1 WHERE id = ?",
-                 (now_str(), row["id"]))
-    conn.commit()
+    # 使用计数改为内存累计 + 批量落库，避免每次请求都 UPDATE + commit
+    _record_token_use(row["id"])
     return user, row
 
 
@@ -688,12 +823,24 @@ def current_user():
 
 
 def require_login():
-    u = current_user()
-    if u is None:
-        if g.get("api_invalid"):
-            return None
-        return None
-    return u
+    """取当前登录用户；未登录返回 None。
+
+    A44：原实现里 `api_invalid` 分支与 fallthrough 的 `return None` 完全等价，
+    是死代码。现在不再在这里做无意义的分支，真正的差异化放在 auth_error()：
+    「带了无效 Token」与「根本没带凭证」给出不同提示。
+    """
+    return current_user()
+
+
+def auth_error():
+    """未登录 / Token 无效的统一错误响应。
+
+    A44：把原先被埋在 require_login() 里的死分支改成真正生效的差异化处理 ——
+    无效 Token（api_invalid）明确提示凭证问题，未登录才提示会话失效。
+    """
+    if g.get("api_invalid"):
+        return err("Token 无效或已过期，请重新获取", 401)
+    return err("登录已失效", 401)
 
 
 def member_info(u):
@@ -1083,7 +1230,7 @@ def api_logout():
 def api_change_password():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     old, new = d.get("oldPassword") or "", d.get("newPassword") or ""
     if not check_password_hash(u["pwd_hash"], old):
@@ -1133,14 +1280,14 @@ def api_visit():
 def api_events():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(200, int(request.args.get("pageSize", 6) or 6)))
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 6, lo=1, hi=200)
     keyword = (request.args.get("keyword") or "").strip().lower()
     level = (request.args.get("level") or "").strip()
     status = (request.args.get("status") or "").strip()
-    archived = int(request.args.get("archived", 0) or 0)
+    archived = qint("archived", 0)
     tag_id = (request.args.get("tag") or "").strip()
     date_filter = (request.args.get("date") or "").strip()
 
@@ -1178,7 +1325,7 @@ def api_events():
 def api_event_get(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     row = conn.execute("SELECT * FROM events WHERE id = ? AND user_id = ?", (eid, u["id"])).fetchone()
     if not row:
@@ -1190,7 +1337,7 @@ def api_event_get(eid):
 def api_event_create():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     title = (d.get("title") or "").strip()
     if not title:
@@ -1239,7 +1386,7 @@ def api_event_create():
 def api_event_update(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     row = conn.execute("SELECT * FROM events WHERE id = ? AND user_id = ?", (eid, u["id"])).fetchone()
     if not row:
@@ -1299,7 +1446,7 @@ def api_event_update(eid):
 def api_event_delete(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     if not conn.execute("SELECT 1 FROM events WHERE id=? AND user_id=?", (eid, u["id"])).fetchone():
         return err("记录不存在")
@@ -1314,7 +1461,7 @@ def api_event_delete(eid):
 def api_event_status(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     status = d.get("status") if d.get("status") in ("doing", "done") else "done"
     conn = db()
@@ -1359,7 +1506,7 @@ def api_event_status(eid):
 def api_event_repeat(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     if not conn.execute("SELECT 1 FROM events WHERE id=? AND user_id=?", (eid, u["id"])).fetchone():
         return err("记录不存在")
@@ -1384,7 +1531,7 @@ def api_event_repeat(eid):
 def api_event_minutes(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     try:
         mins = max(0, min(100000, int(d.get("minutes") or 0)))
@@ -1400,7 +1547,7 @@ def api_event_minutes(eid):
 def api_event_archive(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     flag = 1 if d.get("archived") else 0
     conn = db()
@@ -1414,7 +1561,7 @@ def api_event_archive(eid):
 def api_calendar():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     try:
         year = int(request.args.get("year") or date.today().year)
         month = int(request.args.get("month") or date.today().month)
@@ -1441,7 +1588,7 @@ def api_calendar():
 def api_summary():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     rows = conn.execute("SELECT * FROM events WHERE user_id=?", (u["id"],)).fetchall()
     now = datetime.now()
@@ -1471,7 +1618,7 @@ def api_summary():
 def api_tags():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     rows = db().execute("SELECT id, name, color FROM tags WHERE user_id=? ORDER BY id",
                         (u["id"],)).fetchall()
     return ok({"list": [{"id": r["id"], "name": r["name"], "color": r["color"]} for r in rows]})
@@ -1481,7 +1628,7 @@ def api_tags():
 def api_tag_create():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     name = (d.get("name") or "").strip()[:30]
     if not name:
@@ -1503,7 +1650,7 @@ def api_tag_create():
 def api_tag_delete(tid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     if not conn.execute("SELECT 1 FROM tags WHERE id=? AND user_id=?", (tid, u["id"])).fetchone():
         return err("标签不存在")
@@ -1526,7 +1673,7 @@ def owned_subtask(conn, sid, uid):
 def api_subtask_update(sid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     row = owned_subtask(conn, sid, u["id"])
     if not row:
@@ -1549,7 +1696,7 @@ def api_subtask_update(sid):
 def api_subtask_delete(sid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     if not owned_subtask(conn, sid, u["id"]):
         return err("子任务不存在")
@@ -1564,7 +1711,7 @@ def api_subtask_delete(sid):
 def api_settings_get():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     row = conn.execute("SELECT * FROM user_setting WHERE user_id=?", (u["id"],)).fetchone()
     if not row:
@@ -1579,7 +1726,7 @@ def api_settings_get():
 def api_settings_save():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     conn = db()
     conn.execute("INSERT OR IGNORE INTO user_setting(user_id) VALUES (?)", (u["id"],))
@@ -1599,7 +1746,7 @@ def api_settings_save():
 def api_member_status():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, expire, days = member_info(u)
     return ok({"is_member": is_member, "expire_at": expire, "days_left": days,
                "points": int(u["points"] or 0), "point_cost": POINT_COST})
@@ -1609,7 +1756,7 @@ def api_member_status():
 def api_member_plans():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     return ok({
         "plans": PLAN_LIST,
         "max_proof_kb": MAX_PROOF_KB,
@@ -1629,7 +1776,7 @@ def api_member_plans():
 def api_member_points():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     # 新版前端用 page+size 分页；旧版用 limit 截断，两种参数都兼容
     if request.args.get("page") is not None or request.args.get("size") is not None:
@@ -1646,7 +1793,7 @@ def api_member_points():
             "SELECT * FROM points_log WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
             (u["id"], size, (page - 1) * size)).fetchall()
     else:
-        limit = max(1, min(200, int(request.args.get("limit", 50) or 50)))
+        limit = qint("limit", 50, lo=1, hi=200)
         total = conn.execute("SELECT COUNT(*) c FROM points_log WHERE user_id=?",
                              (u["id"],)).fetchone()["c"]
         size = limit
@@ -1667,7 +1814,7 @@ def api_member_points():
 def api_member_apply():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     plan = (request.form.get("plan") or "").strip()
     remark = (request.form.get("remark") or "").strip()
     chosen = next((p for p in PLAN_LIST if p["key"] == plan), None)
@@ -1702,7 +1849,7 @@ def api_member_apply():
 def api_dashboard():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("数据统计仪表盘")
@@ -1753,7 +1900,7 @@ def api_dashboard():
 def api_notify():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     invites = conn.execute("SELECT COUNT(*) c FROM invites WHERE invitee_id=? AND status='pending'",
                            (u["id"],)).fetchone()["c"]
@@ -1782,9 +1929,9 @@ def api_notify():
 def api_notices():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+        return auth_error()
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     rows = conn.execute(
         "SELECT n.*, s.read_time, s.deleted FROM notices n LEFT JOIN notice_state s "
@@ -1809,7 +1956,7 @@ def api_notices():
 def api_notice_delete(nid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     conn.execute("INSERT INTO notice_state(user_id, notice_id, read_time, deleted) VALUES (?,?,?,1) "
                  "ON CONFLICT(user_id, notice_id) DO UPDATE SET deleted=1",
@@ -1822,7 +1969,7 @@ def api_notice_delete(nid):
 def api_feedback_list():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     rows = conn.execute("SELECT * FROM feedback WHERE user_id=? ORDER BY id DESC", (u["id"],)).fetchall()
     unread = sum(1 for r in rows if r["reply"] and not r["read_time"])
@@ -1841,7 +1988,7 @@ def api_feedback_list():
 def api_feedback_create():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     content = (d.get("content") or "").strip()
     if len(content) < 5:
@@ -1860,7 +2007,7 @@ def api_feedback_create():
 def api_feedback_read():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     conn.execute("UPDATE feedback SET read_time=? WHERE user_id=? AND reply<>'' AND read_time=''",
                  (now_str(), u["id"]))
@@ -1881,12 +2028,12 @@ def team_member_rows(conn, tid):
 def api_team_list():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     trows = conn.execute(
         "SELECT t.*, m.role FROM teams t JOIN memberships m ON m.team_id=t.id "
@@ -1929,7 +2076,7 @@ def api_team_list():
 def api_team_create():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
@@ -1951,7 +2098,7 @@ def api_team_create():
 def api_team_rename(tid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -1971,7 +2118,7 @@ def api_team_rename(tid):
 def api_team_disband(tid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -1987,7 +2134,7 @@ def api_team_disband(tid):
 def api_team_remove_member(tid, uid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -2007,7 +2154,7 @@ def api_team_remove_member(tid, uid):
 def api_team_members(tid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -2031,7 +2178,7 @@ def api_team_members(tid):
 def api_team_pending(tid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -2049,7 +2196,7 @@ def api_team_pending(tid):
 def api_team_search():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
@@ -2069,7 +2216,7 @@ def api_team_search():
 def api_team_invite(tid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
@@ -2105,12 +2252,12 @@ def api_team_invite(tid):
 def api_team_invites_sent():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     rows = conn.execute(
         "SELECT i.*, t.name team_name, t.deleted team_deleted, us.nickname uname, us.email uemail "
@@ -2131,7 +2278,7 @@ def api_team_invites_sent():
 def api_invite_respond(mid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     action = d.get("action")
     conn = db()
@@ -2164,7 +2311,7 @@ def api_invite_respond(mid):
 def api_invite_revoke(mid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     inv = conn.execute("SELECT * FROM invites WHERE id=?", (mid,)).fetchone()
     if not inv:
@@ -2180,7 +2327,7 @@ def api_invite_revoke(mid):
 def api_member_profile(tid, uid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -2218,15 +2365,15 @@ def api_member_profile(tid, uid):
 def api_member_reports(tid, uid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
         return err("团队不存在")
     if t["owner_id"] != u["id"]:
         return err("只有组长能查看组员的汇报内容")
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 8) or 8)))
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 8, lo=1, hi=50)
     kind = (request.args.get("kind") or "").strip()
     sql = "SELECT * FROM reports WHERE user_id=?"
     params = [uid]
@@ -2257,7 +2404,7 @@ def api_member_reports(tid, uid):
 def api_member_remark(tid, uid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     t = conn.execute("SELECT * FROM teams WHERE id=? AND deleted=0", (tid,)).fetchone()
     if not t:
@@ -2277,7 +2424,7 @@ def api_member_remark(tid, uid):
 def api_event_share(eid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
@@ -2315,9 +2462,9 @@ def api_event_share(eid):
 def api_share_inbox():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+        return auth_error()
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     rows = conn.execute(
         "SELECT s.*, us.nickname from_nick, t.name team_name FROM shares s "
@@ -2337,9 +2484,9 @@ def api_share_inbox():
 def api_share_sent():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+        return auth_error()
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     rows = conn.execute(
         "SELECT s.*, us.nickname to_nick, t.name team_name FROM shares s "
@@ -2358,7 +2505,7 @@ def api_share_sent():
 def api_share_respond(sid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     action = d.get("action")
     conn = db()
@@ -2387,7 +2534,7 @@ def api_share_respond(sid):
 def api_share_revoke(sid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     if not conn.execute("SELECT 1 FROM shares WHERE id=? AND from_user=?", (sid, u["id"])).fetchone():
         return err("同步记录不存在")
@@ -2457,7 +2604,7 @@ def build_report_content(conn, uid, kind, start_s, end_s):
 def api_report_get():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("AI 日报周报")
@@ -2482,7 +2629,7 @@ def api_report_get():
 def api_report_generate():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("AI 日报周报")
@@ -2555,7 +2702,7 @@ def api_report_generate():
 def api_report_save(rid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     if not conn.execute("SELECT 1 FROM reports WHERE id=? AND user_id=?", (rid, u["id"])).fetchone():
         return err("汇报不存在")
@@ -2570,7 +2717,7 @@ def api_report_save(rid):
 def api_report_send(rid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     is_member, _, _ = member_info(u)
     if not is_member:
         return vip_required("团队协作")
@@ -2599,7 +2746,7 @@ def api_report_send(rid):
 def api_report_replies(rid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     r = conn.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
     if not r:
@@ -2626,7 +2773,7 @@ def api_report_replies(rid):
 def api_report_reply(rid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     d = request.get_json(silent=True) or {}
     content = (d.get("content") or "").strip()
     if not content:
@@ -2649,7 +2796,7 @@ def api_report_reply(rid):
 def api_report_replies_read(rid):
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     conn = db()
     conn.execute("UPDATE report_replies SET read_time=? WHERE report_id=? AND user_id<>? AND read_time=''",
                  (now_str(), rid, u["id"]))
@@ -2661,9 +2808,9 @@ def api_report_replies_read(rid):
 def api_report_inbox():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+        return auth_error()
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     rows = conn.execute(
         "SELECT rs.*, rp.kind, rp.title, rp.content, rp.period_start, rp.period_end, "
@@ -2695,9 +2842,9 @@ def api_report_inbox():
 def api_report_sent():
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
-    page = max(1, int(request.args.get("page", 1) or 1))
-    page_size = max(1, min(50, int(request.args.get("pageSize", 10) or 10)))
+        return auth_error()
+    page = qint("page", 1, lo=1)
+    page_size = qint("pageSize", 10, lo=1, hi=50)
     conn = db()
     rows = conn.execute("SELECT * FROM reports WHERE user_id=? ORDER BY id DESC", (u["id"],)).fetchall()
     page_rows, page, pages, total = paginate(rows, page, page_size)
@@ -3029,20 +3176,34 @@ def ai_token_create():
 
     d = ai_body()
     name = (d.get("name") or "ai-client").strip()[:60]
-    scope = (d.get("scope") or "read,write").strip()
-    if scope not in ("read", "read,write", "write"):
-        return ai_err("scope 只能是 read / write / read,write")
+    # A12：scope 由服务端按账号能力封顶，调用方不能自选超出的权限。
+    # cap 是该账号允许的能力集合，请求的 scope 必须是它的子集。
+    cap = token_scope_cap(u)
+    cap_parts = {x.strip() for x in cap.split(",") if x.strip()}
+    req = (d.get("scope") or "").strip()
+    if req:
+        if req not in ("read", "read,write", "write"):
+            return ai_err("scope 只能是 read / write / read,write")
+        req_parts = {x.strip() for x in req.split(",") if x.strip()}
+        if not req_parts.issubset(cap_parts):
+            return ai_err("当前账号无权申请该 scope", 403, "scope_forbidden")
+        scope = req
+    else:
+        # 不传 scope 时按账号能力给满（而不是默认给全权）
+        scope = cap
     raw = "memo_" + secrets.token_urlsafe(32)
+    expires_at = fmt_dt(datetime.now() + timedelta(days=TOKEN_TTL_DAYS))
     conn = db()
     cur = conn.execute(
-        "INSERT INTO api_tokens(user_id, name, token_hash, prefix, scope, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (u["id"], name, hash_token(raw), raw[:12], scope, now_str()),
+        "INSERT INTO api_tokens(user_id, name, token_hash, prefix, scope, created_at, expires_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (u["id"], name, hash_token(raw), raw[:12], scope, now_str(), expires_at),
     )
     conn.commit()
     clear_token_cache()
     return ai_ok({
         "id": cur.lastrowid, "name": name, "scope": scope,
+        "expires_at": expires_at,
         "token": raw,          # 仅此一次返回明文
         "hint": "请立即保存，服务端只存哈希，之后无法再次查看",
     })
@@ -3054,7 +3215,7 @@ def ai_token_list():
     if e:
         return e
     rows = db().execute(
-        "SELECT id, name, prefix, scope, created_at, last_used, use_count, revoked "
+        "SELECT id, name, prefix, scope, created_at, last_used, use_count, revoked, expires_at "
         "FROM api_tokens WHERE user_id = ? ORDER BY id DESC", (u["id"],)).fetchall()
     return ai_ok([dict(r) for r in rows])
 
@@ -3824,12 +3985,19 @@ def run_housekeeping():
         conn.execute("PRAGMA busy_timeout = 5000")
         stats["idempotency"] = idem_cleanup(conn)
         stats["visits"] = cleanup_visits(conn)
+        # 使用计数是批量落库的，清理前先落一次，避免 last_used 停在旧值
+        _flush_token_use()
+        # 已过期（expires_at 到期）的 Token 直接吊销
+        cur = conn.execute(
+            "UPDATE api_tokens SET revoked = 1 WHERE revoked = 0 AND expires_at <> '' "
+            "AND expires_at < ?", (now_str(),))
+        stats["tokens"] = cur.rowcount
         # 90 天未使用的 Token 自动吊销，减少僵尸凭据
         cutoff = (datetime.now() - timedelta(days=90)).strftime(DT_FMT)
         cur = conn.execute(
             "UPDATE api_tokens SET revoked = 1 WHERE revoked = 0 AND last_used <> '' "
             "AND last_used < ?", (cutoff,))
-        stats["tokens"] = cur.rowcount
+        stats["tokens"] += cur.rowcount
         conn.commit()
         conn.close()
     except sqlite3.Error as exc:
@@ -3849,7 +4017,7 @@ def api_backup():
     """
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     try:
         path = backup_db()
     except sqlite3.Error as exc:
@@ -3864,7 +4032,7 @@ def api_backup_download(name):
     """下载备份文件。只允许 data 目录下以 memo-backup- 开头的 .db，防目录穿越。"""
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     if not re.fullmatch(r"memo-backup-\d{8}-\d{6}(-[a-z-]+|-\d+)?.db", name):
         return err("备份文件名非法", 400)
     return send_from_directory(DATA_DIR, name, as_attachment=True,
@@ -3879,7 +4047,7 @@ def api_restore():
     """
     u = require_login()
     if not u:
-        return err("登录已失效", 401)
+        return auth_error()
     f = request.files.get("file")
     if not f or not f.filename:
         return err("请选择一个 .db 备份文件")
